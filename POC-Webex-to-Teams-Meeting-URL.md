@@ -2,7 +2,7 @@
 
 ## 1. POC outcome and design
 
-For a tightly scoped pilot, use EWS against Exchange Server SE to find and update organizer-owned, single-instance calendar meetings in the on-premises mailboxes. For each eligible meeting, use Microsoft Graph `onlineMeeting:createOrGet` with the organizer's Entra object ID to create or retrieve a Teams join URL, then replace the one Webex URL in the event body and send an updated meeting request to its attendees. The API is keyed to the Teams user, while the calendar event stays on-premises; this fit is an inference from the API request model, so prove it with one pilot organizer before processing more meetings. [Graph `createOrGet`](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-createorget?view=graph-rest-1.0)
+For a tightly scoped pilot, use EWS against Exchange Server SE to find and update organizer-owned single meetings and recurring series in the on-premises mailboxes. For each eligible event or series, use Microsoft Graph `onlineMeeting:createOrGet` with the organizer's Entra object ID to create or retrieve a Teams join URL, then replace the one Webex URL in the item body and send an updated meeting request to its attendees. The API is keyed to the Teams user, while the calendar event stays on-premises; this fit is an inference from the API request model, so prove it with one pilot organizer before processing more meetings. [Graph `createOrGet`](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-createorget?view=graph-rest-1.0)
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,11 @@ HMA supports EWS as a protocol. For this POC, the included script uses an on-pre
 
 ## 2. POC boundaries
 
-Start with a few test users and only future, organizer-owned, single-instance meetings that contain exactly one Webex URL in the message body. The script skips recurring meetings, attendee copies, cancelled meetings, bodies with zero or multiple Webex URLs, and meetings already containing a Teams URL. It scans the body only; it does not interpret Webex-specific dial-in blocks, custom fields, meeting locations, or all Cisco invite templates. Review candidate invites and the generated invite text manually.
+Start with a few test users and future organizer-owned meetings that contain exactly one Webex URL in the message body. The script supports both single-instance meetings and recurring series. For a recurring series, EWS calendar expansion finds an occurrence in the requested window, the script binds to its recurring master, and updates the master once; all occurrences in the series use one shared Teams URL. It skips attendee copies, cancelled meetings, bodies with zero or multiple Webex URLs, and meetings already containing a Teams URL. It scans the series master's body only; it does not interpret Webex-specific dial-in blocks, custom fields, meeting locations, or all Cisco invite templates. Review candidate invites and the generated invite text manually.
+
+Start recurring coverage with a simple series without modified occurrences. If a series has modified occurrences (exceptions), the script marks it in the report but updates only the recurring master; it does not rewrite exception bodies independently. After applying, inspect each exception invite and manually replace any remaining Webex URL before treating the series as migrated. EWS expands recurring series into occurrences for calendar views and updates the recurring master to apply changes to a series. [EWS recurrence views](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/recurrence-patterns-and-ews), [updating a recurring series](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-update-a-recurring-series-by-using-ews-in-exchange)
+
+The script creates one standalone Graph meeting object and reuses its join URL for the whole series. Microsoft documents a 60-day expiry after the meeting's start or end, extended by another 60 days if the meeting is updated or activated before it expires. Recurring series with gaps longer than 60 days need additional validation and may need the link regenerated. [Graph onlineMeeting lifetime](https://learn.microsoft.com/en-us/graph/api/resources/onlinemeeting?view=graph-rest-1.0)
 
 This creates a new Teams meeting and substitutes its join URL. It does not migrate Webex meeting IDs, host keys, dial-in details, registration, recordings, attendance data, or Webex policies. Treat the attendee update as a new Teams join instruction and validate the Teams meeting policy separately.
 
@@ -66,7 +70,7 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 
 1. Select 2–5 test organizers whose mailboxes are on-premises and who are enabled/licensed for Teams.
 2. Choose a future UTC scan window, for example the next 14 days.
-3. Use one-off test meetings first. Include only meetings where the test mailbox is the organizer and where sending an update to the attendees is acceptable.
+3. Use one-off test meetings first, then a simple recurring test series with at least two occurrences in the scan window. Include only meetings where the test mailbox is the organizer and where sending updates to attendees is acceptable.
 4. Create a protected working folder for the script, CSV, report, and backup. The backup stores original message bodies.
 
 ### Step 2 — Create and authorize the Graph app
@@ -158,13 +162,22 @@ If this role assignment or scope already exists, inspect and validate it rather 
 
 ### Step 6 — Prepare the target CSV
 
-Create `targets.csv` with these exact headers. The `EntraObjectId` is the organizer's object ID in the tenant, not the mailbox GUID.
+Add the pilot organizer addresses to `pilot-mailboxes.csv`. `MailboxSmtp` is the on-premises primary SMTP address. `EntraUserPrincipalName` is optional; supply it if the SMTP address is an alias or does not match the user's Entra sign-in name.
 
 ```csv
-MailboxSmtp,EntraObjectId
-pilot.organizer@contoso.com,00000000-0000-0000-0000-000000000001
-pilot.organizer2@contoso.com,00000000-0000-0000-0000-000000000002
+MailboxSmtp,EntraUserPrincipalName
+pilot.organizer@contoso.com,
+pilot.organizer2@contoso.com,pilot.organizer2@contoso.com
 ```
+
+Resolve the Entra object IDs and generate `targets.csv`:
+
+```powershell
+Install-Module Microsoft.Graph.Users -Scope CurrentUser
+.\scripts\New-TargetsCsv.ps1 -InputCsv ".\pilot-mailboxes.csv" -OutputCsv ".\targets.csv" -Force
+```
+
+The helper signs in interactively with delegated, read-only `User.ReadBasic.All` to look up the users' basic profiles, including ID, mail, and UPN. This permission is used only by the helper and does not need to be added to the POC's Teams meeting app. Inspect the generated IDs before using the file. [Graph list users permissions](https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0), [User.ReadBasic.All profile fields](https://learn.microsoft.com/en-us/graph/permissions-reference)
 
 ## 5. Run the POC
 
@@ -186,11 +199,11 @@ $ewsCredential = Get-Credential "CONTOSO\svc_webex_teams_poc"
   -ReportPath ".\preview.csv"
 ```
 
-Review each `WouldApply` row and the skip reasons. Validate that eligible meetings are organizer-owned, single-instance, and have exactly one intended Webex join URL in the body. Preview never calls Graph.
+Review each `WouldApply` and `WouldApplyRecurringSeries` row and the skip reasons. Validate that eligible meetings are organizer-owned and have exactly one intended Webex URL in the relevant single item or recurring master body. For recurring series, check `MeetingScope` and `HasModifiedOccurrences`. Preview never calls Graph.
 
 ### Step 8 — Apply to the smallest possible sample
 
-1. Start with one test organizer and one meeting with only a test attendee.
+1. Start with one test organizer and one single-instance meeting with only a test attendee.
 2. For the first apply, create a one-row `targets-one.csv` so only that organizer is processed. Run:
 
    ```powershell
@@ -213,13 +226,14 @@ Review each `WouldApply` row and the skip reasons. Validate that eligible meetin
 4. Confirm the organizer's Exchange item has the Teams link and no longer has the original Webex URL.
 5. Confirm the attendee receives an update (EWS sends to all meeting attendees when the meeting is updated) and can open/join the Teams meeting.
 6. Confirm the Teams app access policy permits the organizer, the lobby/anonymous-join policy behaves as expected, and the Teams meeting object's date/time and subject are appropriate.
-7. Expand to the rest of the pilot only after this end-to-end check succeeds.
+7. Repeat with one simple recurring series without modified occurrences. Confirm the master contains the new URL and multiple occurrences in the series use it. If the report says `HasModifiedOccurrences`, inspect each changed occurrence's invite body and manually replace any remaining Webex URL; the script does not patch exception bodies individually.
+8. Expand to the rest of the pilot only after these end-to-end checks succeed.
 
 EWS meeting updates should be saved with `SendToAllAndSaveCopy`; recipients receive updated meeting requests. [EWS meeting update behavior](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-update-appointments-and-meetings-by-using-ews-in-exchange)
 
 ### Step 9 — Roll back if needed
 
-Run the script in `Rollback` mode against the JSONL backup created by `Apply`. It restores the original body for each matching item and sends a meeting update. The Teams online meeting object is not deleted; it may remain unused. If rollback is successful, restore the original `CustomAttribute15` values from the CSV you exported, then remove the scope, role assignment, and Teams policy when no longer needed.
+Run the script in `Rollback` mode against the JSONL backup created by `Apply`. It restores the original body on each single item or recurring master and sends a meeting update (for a recurring master, the update is for the series). It does not independently back up or restore exception bodies, so manually reviewed/edited exceptions need their own rollback handling. The Teams online meeting object is not deleted; it may remain unused. If rollback is successful, restore the original `CustomAttribute15` values from the CSV you exported, then remove the scope, role assignment, and Teams policy when no longer needed.
 
 ```powershell
 .\scripts\Convert-WebexMeetingsToTeams.ps1 `
@@ -244,7 +258,7 @@ Restore the attributes from the exported file by setting each mailbox's prior `C
 ## 6. Script files and execution notes
 
 - Script: [scripts/Convert-WebexMeetingsToTeams.ps1](scripts/Convert-WebexMeetingsToTeams.ps1)
-- Graph API `createOrGet` uses a deterministic external ID derived from organizer, iCalendar UID, and start time. This makes retries idempotent for the same event version; if the event's start time changes, the script creates/retrieves a distinct Teams meeting.
+- Graph API `createOrGet` uses a deterministic external ID derived from organizer, iCalendar UID, and start time. For a recurring series, it uses the recurring master's start time for a stable series ID while setting the Graph meeting time to the occurrence in the scan window. This makes retries idempotent for the same single event or recurring series.
 - The script requires exactly one URL matching `webex.com` or `webex.eu` in the body. If an invite contains several Webex URLs or custom dial-in content, review and migrate that item manually.
 - Graph app access policy authorizes the meeting API for the user. It does not grant EWS permissions. The EWS role assignment and the Graph app policy are separate controls.
 - Do not use Graph Calendar API to read/write these on-premises mailbox events. The standard Outlook calendar Graph APIs are for mailbox data stored in Exchange Online. Here, Graph is used only for Teams meeting generation; EWS owns the on-premises calendar item. [Graph Outlook calendar data scope](https://learn.microsoft.com/en-us/graph/outlook-calendar-concept-overview)

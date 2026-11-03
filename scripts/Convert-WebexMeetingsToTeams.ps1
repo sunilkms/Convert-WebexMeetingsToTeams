@@ -160,7 +160,8 @@ function New-DetailPropertySet {
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::IsRecurring,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::AppointmentType,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::MyResponseType,
-        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ICalUid
+        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ICalUid,
+        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ModifiedOccurrences
     ) | ForEach-Object { $props.Add($_) }
     return $props
 }
@@ -260,7 +261,8 @@ else {
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::IsMeeting,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::IsCancelled,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::AppointmentType,
-        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::MyResponseType
+        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::MyResponseType,
+        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ICalUid
     ) | ForEach-Object { $findProps.Add($_) }
 
     $startUtc = [DateTime]::SpecifyKind($WindowStartUtc, [DateTimeKind]::Utc)
@@ -277,6 +279,7 @@ else {
                 [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Calendar,
                 $view
             )
+            $processedRecurringSeries = @{}
 
             foreach ($candidate in $items.Items) {
                 $subject = [string]$candidate.Subject
@@ -285,6 +288,8 @@ else {
                     MailboxSmtp = $mailbox
                     Subject = $subject
                     StartUtc = $startLabel
+                    MeetingScope = 'Single'
+                    HasModifiedOccurrences = $false
                     OriginalWebexUrl = ''
                     TeamsJoinUrl = ''
                     Status = ''
@@ -299,16 +304,93 @@ else {
                     $base.Status = 'SkippedCancelled'; $base.Note = 'Meeting is cancelled.'
                     $report.Add([pscustomobject]$base); continue
                 }
-                if ([string]$candidate.AppointmentType -ne 'Single') {
-                    $base.Status = 'SkippedRecurring'; $base.Note = 'Only single-instance meetings are in the pilot scope.'
-                    $report.Add([pscustomobject]$base); continue
-                }
                 if ([string]$candidate.MyResponseType -ne 'Organizer') {
                     $base.Status = 'SkippedNotOrganizer'; $base.Note = 'Mailbox is not the organizer of this calendar item.'
                     $report.Add([pscustomobject]$base); continue
                 }
 
-                $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id, $detailProps)
+                $appointmentType = [string]$candidate.AppointmentType
+                $seriesLookupKey = ''
+                if ($appointmentType -in @('Occurrence', 'Exception', 'RecurringMaster') -and $candidate.ICalUid) {
+                    $seriesLookupKey = '{0}|{1}' -f $mailbox.ToLowerInvariant(), [string]$candidate.ICalUid
+                    if ($processedRecurringSeries.ContainsKey($seriesLookupKey)) {
+                        $base.MeetingScope = 'RecurringSeries'
+                        $base.Status = 'SkippedDuplicateSeriesOccurrence'
+                        $base.Note = 'This recurring series was already processed from another occurrence in the window.'
+                        $report.Add([pscustomobject]$base); continue
+                    }
+                }
+                $meetingStart = $candidate.Start
+                $meetingEnd = $candidate.End
+                $identityStart = $candidate.Start
+
+                if ($appointmentType -eq 'Single') {
+                    $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id, $detailProps)
+                }
+                elseif ($appointmentType -in @('Occurrence', 'Exception')) {
+                    try {
+                        # CalendarView expands recurring series into occurrences/exceptions.
+                        # Bind to the series master so one body update covers the whole series.
+                        $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::BindToRecurringMaster($service, $candidate.Id)
+                        $appointment.Load($detailProps)
+                    }
+                    catch {
+                        $base.MeetingScope = 'RecurringSeries'
+                        $base.Status = 'RecurringMasterBindError'
+                        $base.Note = $_.Exception.Message
+                        $report.Add([pscustomobject]$base); continue
+                    }
+
+                    $base.MeetingScope = 'RecurringSeries'
+                    $identityStart = $appointment.Start
+                    if (-not $seriesLookupKey) {
+                        $seriesLookupKey = '{0}|{1}' -f $mailbox.ToLowerInvariant(), [string]$appointment.ICalUid
+                    }
+                    if ($processedRecurringSeries.ContainsKey($seriesLookupKey)) {
+                        $base.Status = 'SkippedDuplicateSeriesOccurrence'
+                        $base.Note = 'This recurring series was already processed from another occurrence in the window.'
+                        $report.Add([pscustomobject]$base); continue
+                    }
+                    $processedRecurringSeries[$seriesLookupKey] = $true
+
+                    if ($appointment.ModifiedOccurrences -and $appointment.ModifiedOccurrences.Count -gt 0) {
+                        $base.HasModifiedOccurrences = $true
+                    }
+                }
+                elseif ($appointmentType -eq 'RecurringMaster') {
+                    $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id, $detailProps)
+                    $base.MeetingScope = 'RecurringSeries'
+                    $identityStart = $appointment.Start
+                    if (-not $seriesLookupKey) {
+                        $seriesLookupKey = '{0}|{1}' -f $mailbox.ToLowerInvariant(), [string]$appointment.ICalUid
+                    }
+                    if ($processedRecurringSeries.ContainsKey($seriesLookupKey)) {
+                        $base.Status = 'SkippedDuplicateSeriesOccurrence'
+                        $base.Note = 'This recurring series was already processed from another occurrence in the window.'
+                        $report.Add([pscustomobject]$base); continue
+                    }
+                    $processedRecurringSeries[$seriesLookupKey] = $true
+                    if ($appointment.ModifiedOccurrences -and $appointment.ModifiedOccurrences.Count -gt 0) {
+                        $base.HasModifiedOccurrences = $true
+                    }
+                }
+                else {
+                    $base.Status = 'SkippedUnsupportedCalendarItemType'
+                    $base.Note = "Unsupported EWS appointment type: $appointmentType"
+                    $report.Add([pscustomobject]$base); continue
+                }
+
+                if (-not $appointment.IsMeeting -or $appointment.IsCancelled) {
+                    $base.Status = 'SkippedSeriesMasterNotActiveMeeting'
+                    $base.Note = 'The bound item is not an active organizer meeting.'
+                    $report.Add([pscustomobject]$base); continue
+                }
+                if ([string]$appointment.MyResponseType -ne 'Organizer') {
+                    $base.Status = 'SkippedSeriesMasterNotOrganizer'
+                    $base.Note = 'The mailbox is not the organizer of the bound recurring master.'
+                    $report.Add([pscustomobject]$base); continue
+                }
+
                 $bodyText = [string]$appointment.Body.Text
                 if ($bodyText -match '(?i)teams\.microsoft\.com/l/meetup-join') {
                     $base.Status = 'SkippedAlreadyTeams'; $base.Note = 'A Teams join URL is already present.'
@@ -333,28 +415,40 @@ else {
                 }
 
                 if ($Mode -eq 'Preview') {
-                    $base.Status = 'WouldApply'; $base.Note = 'Preview only; Graph was not called and Exchange was not changed.'
+                    $base.Status = if ($base.MeetingScope -eq 'RecurringSeries') { 'WouldApplyRecurringSeries' } else { 'WouldApply' }
+                    $base.Note = 'Preview only; Graph was not called and Exchange was not changed.'
+                    if ($base.HasModifiedOccurrences) {
+                        $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
+                    }
                     $report.Add([pscustomobject]$base); continue
                 }
 
                 try {
-                    $externalId = New-TeamsExternalId -MailboxSmtp $mailbox -ICalUid ([string]$appointment.ICalUid) -Start $appointment.Start
+                    $externalId = New-TeamsExternalId -MailboxSmtp $mailbox -ICalUid ([string]$appointment.ICalUid) -Start $identityStart
                     $teamsUrl = Get-TeamsJoinUrl -EntraObjectId $entraObjectId -ExternalId $externalId `
-                        -Subject $appointment.Subject -Start $appointment.Start -End $appointment.End
+                        -Subject $appointment.Subject -Start $meetingStart -End $meetingEnd
                     $base.TeamsJoinUrl = $teamsUrl
 
                     $bodyType = $appointment.Body.BodyType
                     $newBodyText = Get-NewBodyText -OriginalBody $bodyText -OriginalUrl $oldUrl `
                         -TeamsUrl $teamsUrl -BodyType $bodyType
                     $base.Status = 'ReadyToApply'
-                    $base.Note = 'Graph meeting created or reused. The Teams join URL is prepended and the sole Webex URL is replaced.'
+                    $base.Note = if ($base.MeetingScope -eq 'RecurringSeries') {
+                        'Graph meeting created or reused. The recurring master is updated so the series uses one shared Teams join URL.'
+                    } else {
+                        'Graph meeting created or reused. The Teams join URL is prepended and the sole Webex URL is replaced.'
+                    }
+                    if ($base.HasModifiedOccurrences) {
+                        $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
+                    }
 
                     $backup = [pscustomobject]@{
                         MailboxSmtp = $mailbox
                         ItemId = [string]$appointment.Id.UniqueId
                         ICalUid = [string]$appointment.ICalUid
                         Subject = [string]$appointment.Subject
-                        StartUtc = ConvertTo-UtcIsoString -Value $appointment.Start
+                        StartUtc = ConvertTo-UtcIsoString -Value $meetingStart
+                        MeetingScope = $base.MeetingScope
                         OriginalBodyType = [string]$bodyType
                         OriginalBodyText = $bodyText
                         NewBodyText = $newBodyText
@@ -372,7 +466,11 @@ else {
                         [Microsoft.Exchange.WebServices.Data.SendInvitationsOrCancellationsMode]::SendToAllAndSaveCopy
                     )
                     $base.Status = 'Applied'
-                    $base.Note = 'Updated in Exchange; meeting update sent to all attendees. Review link label and invite content.'
+                    if ($base.MeetingScope -eq 'RecurringSeries') {
+                        $base.Note = 'Updated recurring master; EWS sent a meeting update for the series. This script does not rewrite exception bodies independently; verify and manually update each modified occurrence invite.'
+                    } else {
+                        $base.Note = 'Updated in Exchange; meeting update sent to all attendees. Review link label and invite content.'
+                    }
                 }
                 catch {
                     $base.Status = 'ApplyError'
