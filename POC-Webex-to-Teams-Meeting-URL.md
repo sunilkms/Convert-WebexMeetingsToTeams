@@ -43,7 +43,7 @@ Use UTC timestamps for the scan window. Avoid meetings already in progress or cl
 - A dedicated, enabled on-premises AD service account for EWS. Do not use an Exchange admin account.
 - A test mailbox allowlist and a matching Entra object ID for each organizer. Each organizer must be represented in Entra ID, enabled for Teams, and licensed/configured to create Teams meetings.
 - EWS Managed API 2.2 assembly available from an approved source. The Microsoft EWS Managed API repository is archived; it is used here only as a small POC client wrapper. [Repository](https://github.com/OfficeDev/ews-managed-api)
-- PowerShell 5.1 on Windows, the `Microsoft.Graph.Authentication` PowerShell module, and an app certificate with its private key installed in the certificate store of the script runner.
+- PowerShell 5.1 on Windows, the `Microsoft.Graph.Authentication` PowerShell module, and an app certificate with its private key installed in the certificate store accessible to the Windows account that runs the script.
 
 ### App registration and permissions
 
@@ -76,10 +76,31 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 ### Step 2 — Create and authorize the Graph app
 
 1. Register a single-tenant application, for example `WebexTeamsMeetingUrlPOC`.
-2. Create/upload a certificate credential. Install the certificate with private key on the POC runner and grant private-key read to the account that runs the script.
-3. Add Microsoft Graph **Application** permission `OnlineMeetings.ReadWrite.All`; grant admin consent.
-4. Record tenant ID, app/client ID, and certificate thumbprint. Do not put a certificate password or private-key material in the script or CSV.
-5. Do not add Graph Calendar or Mail permissions.
+2. Sign in to the POC runner as the same Windows account that will run the script. Create a self-signed certificate in that account's `CurrentUser\My` store. This is suitable for the POC; use your organization's approved PKI certificate process for production.
+
+   ```powershell
+   $cert = New-SelfSignedCertificate `
+     -Subject "CN=WebexTeamsMeetingUrlPOC" `
+     -CertStoreLocation "Cert:\CurrentUser\My" `
+     -KeyAlgorithm RSA `
+     -KeyLength 2048 `
+     -HashAlgorithm SHA256 `
+     -KeySpec Signature `
+     -KeyExportPolicy NonExportable `
+     -NotAfter (Get-Date).AddMonths(12)
+
+   $publicCertPath = Join-Path $PWD "WebexTeamsMeetingUrlPOC.cer"
+   Export-Certificate -Cert $cert -FilePath $publicCertPath | Out-Null
+
+   $cert | Format-List Subject, Thumbprint, NotAfter, HasPrivateKey
+   Write-Host "Upload this public certificate file: $publicCertPath"
+   ```
+
+   This keeps the private key in the Windows certificate store and exports only the public `.cer` file. Keep the thumbprint for the script. If a different Windows account or runner will execute the script, create/install a corresponding certificate for that run-as identity and upload its public certificate; the account must be able to read the private key.
+3. In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Certificates** > **Upload certificate**. Select `WebexTeamsMeetingUrlPOC.cer` and add it. Upload only the `.cer`; do not upload or distribute a private key.
+4. Add Microsoft Graph **Application** permission `OnlineMeetings.ReadWrite.All`; grant admin consent.
+5. Record the tenant ID, app/client ID, and certificate thumbprint. Do not put private-key material in the script or CSV.
+6. Do not add Graph Calendar or Mail permissions.
 
 On the runner, install the approved PowerShell modules if they are not already present:
 
@@ -87,6 +108,26 @@ On the runner, install the approved PowerShell modules if they are not already p
 Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 Install-Module MicrosoftTeams -Scope CurrentUser
 ```
+
+Confirm that the certificate and private key are available to the current Windows account, then test app-only Graph authentication:
+
+```powershell
+$thumbprint = "<CERTIFICATE-THUMBPRINT>"
+$cert = Get-Item "Cert:\CurrentUser\My\$thumbprint"
+$cert | Format-List Subject, Thumbprint, NotAfter, HasPrivateKey
+
+Connect-MgGraph `
+  -TenantId "<TENANT-ID>" `
+  -ClientId "<GRAPH-APP-CLIENT-ID>" `
+  -CertificateThumbprint $thumbprint `
+  -ContextScope Process `
+  -NoWelcome
+
+Get-MgContext | Format-List AuthType, TenantId, ClientId, CertificateThumbprint
+Disconnect-MgGraph
+```
+
+Confirm `HasPrivateKey` is `True` and `AuthType` is `AppOnly`. The conversion script uses the same certificate thumbprint with `Connect-MgGraph`. Microsoft Graph PowerShell supports certificate-based app-only authentication from the Windows certificate store. [Graph PowerShell app-only authentication](https://learn.microsoft.com/en-us/powershell/microsoftgraph/app-only?view=graph-powershell-1.0), [Connect-MgGraph certificate parameters](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.authentication/connect-mggraph?view=graph-powershell-1.0)
 
 ### Step 3 — Limit Graph meeting API access to the pilot organizers
 
