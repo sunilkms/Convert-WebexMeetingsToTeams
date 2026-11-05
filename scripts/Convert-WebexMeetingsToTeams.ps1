@@ -6,6 +6,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $EwsUrl,
 
+    [ValidateSet('System', 'Direct', 'SystemDefaultCredentials')]
+    [string] $EwsProxyMode = 'Direct',
+
     [Parameter(Mandatory = $true)]
     [string] $EwsManagedApiDll,
 
@@ -48,7 +51,8 @@ function New-EwsService {
     param(
         [Parameter(Mandatory = $true)][string] $MailboxSmtp,
         [Parameter(Mandatory = $true)][uri] $Endpoint,
-        [Parameter(Mandatory = $true)][System.Management.Automation.PSCredential] $Credential
+        [Parameter(Mandatory = $true)][System.Management.Automation.PSCredential] $Credential,
+        [Parameter(Mandatory = $true)][ValidateSet('System', 'Direct', 'SystemDefaultCredentials')][string] $ProxyMode
     )
 
     $networkCredential = $Credential.GetNetworkCredential()
@@ -56,6 +60,17 @@ function New-EwsService {
         [Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1,
         [TimeZoneInfo]::Utc
     )
+    if ($ProxyMode -eq 'Direct') {
+        # An empty WebProxy has no address and bypasses the system proxy.
+        $service.WebProxy = [System.Net.WebProxy]::new()
+    }
+    elseif ($ProxyMode -eq 'SystemDefaultCredentials') {
+        $systemProxy = [System.Net.WebRequest]::DefaultWebProxy
+        if ($null -ne $systemProxy) {
+            $systemProxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
+            $service.WebProxy = $systemProxy
+        }
+    }
     $service.Url = $Endpoint
     $service.Credentials = [Microsoft.Exchange.WebServices.Data.WebCredentials]::new(
         $networkCredential.UserName,
@@ -239,9 +254,11 @@ if ($Mode -eq 'Rollback') {
     $records = Get-Content -LiteralPath $BackupPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_ | ConvertFrom-Json }
     foreach ($record in $records) {
         try {
-            $service = New-EwsService -MailboxSmtp $record.MailboxSmtp -Endpoint $endpointUri -Credential $EwsCredential
+            $service = New-EwsService -MailboxSmtp $record.MailboxSmtp -Endpoint $endpointUri `
+                -Credential $EwsCredential -ProxyMode $EwsProxyMode
             $itemId = [Microsoft.Exchange.WebServices.Data.ItemId]::new([string]$record.ItemId)
-            $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $itemId, $detailProps)
+            $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $itemId)
+            $appointment.Load($detailProps)
             if ($appointment.Body.Text -cne [string]$record.NewBodyText) {
                 $report.Add([pscustomobject]@{
                     MailboxSmtp = $record.MailboxSmtp; Subject = $record.Subject; StartUtc = $record.StartUtc
@@ -324,7 +341,8 @@ else {
         $mailbox = ([string]$target.MailboxSmtp).Trim()
         $entraObjectId = ([string]$target.EntraObjectId).Trim()
         try {
-            $service = New-EwsService -MailboxSmtp $mailbox -Endpoint $endpointUri -Credential $EwsCredential
+            $service = New-EwsService -MailboxSmtp $mailbox -Endpoint $endpointUri `
+                -Credential $EwsCredential -ProxyMode $EwsProxyMode
             $items = $service.FindAppointments(
                 [Microsoft.Exchange.WebServices.Data.WellKnownFolderName]::Calendar,
                 $view
@@ -355,7 +373,7 @@ else {
                     $report.Add([pscustomobject]$base); continue
                 }
                 if ([string]$candidate.MyResponseType -ne 'Organizer') {
-                    $base.Status = 'SkippedNotOrganizer'; $base.Note = 'Mailbox is not the organizer of this calendar item.'
+                    $base.Status = 'SkippedNotOrganizer'; $base.Note = 'Not organizer.'
                     $report.Add([pscustomobject]$base); continue
                 }
 
@@ -375,7 +393,8 @@ else {
                 $identityStart = $candidate.Start
 
                 if ($appointmentType -eq 'Single') {
-                    $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id, $detailProps)
+                    $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id)
+                    $appointment.Load($detailProps)
                 }
                 elseif ($appointmentType -in @('Occurrence', 'Exception')) {
                     try {
@@ -408,7 +427,8 @@ else {
                     }
                 }
                 elseif ($appointmentType -eq 'RecurringMaster') {
-                    $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id, $detailProps)
+                    $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $candidate.Id)
+                    $appointment.Load($detailProps)
                     $base.MeetingScope = 'RecurringSeries'
                     $identityStart = $appointment.Start
                     if (-not $seriesLookupKey) {
