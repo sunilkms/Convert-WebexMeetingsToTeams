@@ -524,7 +524,8 @@ else {
                     $candidateNumber++
                     $parsedMtid = Get-WebexMtidValue -Url $webexCandidate.Url
                     if ([string]::IsNullOrWhiteSpace($parsedMtid)) { $parsedMtid = '<none>' }
-                    $diagnosticEntries.Add(('#{0} Source={1}; MTID={2}; URL={3}' -f $candidateNumber, $webexCandidate.Source, $parsedMtid, $webexCandidate.Url))
+                    $candidateKind = if ($webexCandidate.Url -match '(?i)/j\.php(?:[?#]|$)') { 'JoinUrl' } else { 'Other' }
+                    $diagnosticEntries.Add(('#{0} Kind={1}; Source={2}; MTID={3}; URL={4}' -f $candidateNumber, $candidateKind, $webexCandidate.Source, $parsedMtid, $webexCandidate.Url))
                 }
                 $base.WebexUrlDiagnostics = $diagnosticEntries.ToArray() -join ' || '
 
@@ -546,6 +547,7 @@ else {
                             Url = $candidateUrl.Url
                             Sources = $sources
                             MtidValue = Get-WebexMtidValue -Url $candidateUrl.Url
+                            IsJoinUrl = $candidateUrl.Url -match '(?i)/j\.php(?:[?#]|$)'
                         }
                     }
                 }
@@ -555,21 +557,33 @@ else {
                     $report.Add([pscustomobject]$base); continue
                 }
 
+                # The scheduled j.php link is the attendee join URL. Cisco call-in links can
+                # also have an MTID, so prefer j.php candidates when any are present.
+                $joinMtidUrls = @($uniqueWebexUrls | Where-Object { $_.IsJoinUrl -and -not [string]::IsNullOrWhiteSpace([string]$_.MtidValue) })
+                if ($joinMtidUrls.Count -gt 0) {
+                    $mtidSelectionPool = $joinMtidUrls
+                    $mtidSelectionDescription = 'j.php join URLs'
+                }
+                else {
+                    $mtidSelectionPool = @($uniqueWebexUrls | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.MtidValue) })
+                    $mtidSelectionDescription = 'Webex URLs'
+                }
+
                 $distinctMtidValues = New-Object System.Collections.Generic.List[string]
-                foreach ($webexUrl in $uniqueWebexUrls) {
+                foreach ($webexUrl in $mtidSelectionPool) {
                     if (-not [string]::IsNullOrWhiteSpace([string]$webexUrl.MtidValue) -and -not $distinctMtidValues.Contains([string]$webexUrl.MtidValue)) {
                         $distinctMtidValues.Add([string]$webexUrl.MtidValue)
                     }
                 }
                 if ($distinctMtidValues.Count -gt 1) {
                     $base.Status = 'SkippedMultipleMtidWebex'
-                    $base.Note = "Found $($distinctMtidValues.Count) different MTID values; manual review required. See WebexUrlDiagnostics for each extracted URL and MTID."
+                    $base.Note = "Found $($distinctMtidValues.Count) different MTID values in $mtidSelectionDescription; manual review required. See WebexUrlDiagnostics for each extracted URL and MTID."
                     $report.Add([pscustomobject]$base); continue
                 }
 
                 if ($distinctMtidValues.Count -eq 1) {
                     $selectedMtidValue = $distinctMtidValues[0]
-                    $selectedWebexUrls = @($uniqueWebexUrls | Where-Object { $_.MtidValue -ceq $selectedMtidValue })
+                    $selectedWebexUrls = @($mtidSelectionPool | Where-Object { $_.MtidValue -ceq $selectedMtidValue })
                 }
                 elseif ($uniqueWebexUrls.Count -eq 1) {
                     $selectedWebexUrls = @($uniqueWebexUrls[0])
@@ -591,12 +605,15 @@ else {
                 }
                 $webexUrlSource = $selectedSources.ToArray() -join '+'
                 $selectionNote = ''
+                if ($joinMtidUrls.Count -gt 0) {
+                    $selectionNote += ' Selected the scheduled j.php join-link group.'
+                }
                 if ($selectedWebexUrls.Count -gt 1) {
                     $selectionNote += " Found $($selectedWebexUrls.Count) URL variants sharing the same MTID; all selected variants will be replaced."
                 }
                 $otherUrlCount = $uniqueWebexUrls.Count - $selectedWebexUrls.Count
                 if ($otherUrlCount -gt 0) {
-                    $selectionNote += " Left $otherUrlCount other Webex URL(s) with a different or no MTID untouched."
+                    $selectionNote += " Left $otherUrlCount other Webex URL(s) outside the selected group untouched."
                 }
                 $base.OriginalWebexUrl = $oldUrl
                 $base.WebexUrlSource = $webexUrlSource
