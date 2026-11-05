@@ -213,7 +213,14 @@ function Get-WebexMtidValue {
         $mtidMatch = [regex]::Match($Url, '(?i)(?:[?&](?:amp;)?|%3f|%26)MTID(?:=|%3d)([^&;#\s]+)')
     }
     if ($mtidMatch.Success) {
-        return [string]$mtidMatch.Groups[1].Value.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']')
+        $mtidValue = [System.Net.WebUtility]::HtmlDecode([string]$mtidMatch.Groups[1].Value)
+        try {
+            $mtidValue = [System.Uri]::UnescapeDataString($mtidValue)
+        }
+        catch {
+            # Keep the extracted value as-is if it contains malformed percent encoding.
+        }
+        return [string]$mtidValue.Trim().TrimEnd('.', ',', ';', ':', '!', '?', ')', ']')
     }
     return ''
 }
@@ -388,6 +395,7 @@ else {
                     HasModifiedOccurrences = $false
                     OriginalWebexUrl = ''
                     WebexUrlSource = ''
+                    WebexUrlDiagnostics = ''
                     TeamsJoinUrl = ''
                     Status = ''
                     Note = ''
@@ -510,6 +518,16 @@ else {
                     }
                 }
 
+                $diagnosticEntries = New-Object System.Collections.Generic.List[string]
+                $candidateNumber = 0
+                foreach ($webexCandidate in $webexCandidates) {
+                    $candidateNumber++
+                    $parsedMtid = Get-WebexMtidValue -Url $webexCandidate.Url
+                    if ([string]::IsNullOrWhiteSpace($parsedMtid)) { $parsedMtid = '<none>' }
+                    $diagnosticEntries.Add(('#{0} Source={1}; MTID={2}; URL={3}' -f $candidateNumber, $webexCandidate.Source, $parsedMtid, $webexCandidate.Url))
+                }
+                $base.WebexUrlDiagnostics = $diagnosticEntries.ToArray() -join ' || '
+
                 # Deduplicate links repeated in the body and Location while retaining their source fields.
                 # Treat full URLs as case-sensitive so distinct meeting IDs are never collapsed.
                 $webexUrlsByValue = [System.Collections.Generic.Dictionary[string, object]]::new(
@@ -545,7 +563,7 @@ else {
                 }
                 if ($distinctMtidValues.Count -gt 1) {
                     $base.Status = 'SkippedMultipleMtidWebex'
-                    $base.Note = "Found $($distinctMtidValues.Count) different MTID values; manual review required."
+                    $base.Note = "Found $($distinctMtidValues.Count) different MTID values; manual review required. See WebexUrlDiagnostics for each extracted URL and MTID."
                     $report.Add([pscustomobject]$base); continue
                 }
 
@@ -558,7 +576,7 @@ else {
                 }
                 else {
                     $base.Status = 'SkippedMultipleWebex'
-                    $base.Note = "Found $($uniqueWebexUrls.Count) distinct Webex URLs and none has an MTID; manual review required."
+                    $base.Note = "Found $($uniqueWebexUrls.Count) distinct Webex URLs and none has an MTID; manual review required. See WebexUrlDiagnostics for each extracted URL."
                     $report.Add([pscustomobject]$base); continue
                 }
 
@@ -666,7 +684,7 @@ else {
         }
         catch {
             $report.Add([pscustomobject]@{
-                MailboxSmtp = $mailbox; Subject = ''; StartUtc = ''; OriginalWebexUrl = ''; WebexUrlSource = ''; TeamsJoinUrl = ''
+                MailboxSmtp = $mailbox; Subject = ''; StartUtc = ''; OriginalWebexUrl = ''; WebexUrlSource = ''; WebexUrlDiagnostics = ''; TeamsJoinUrl = ''
                 Status = 'MailboxError'; Note = $_.Exception.Message
             })
         }

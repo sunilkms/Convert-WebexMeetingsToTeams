@@ -28,7 +28,7 @@ The script creates one standalone Graph meeting object and reuses its join URL f
 
 This creates a new Teams meeting and substitutes its join URL. It does not migrate Webex meeting IDs, host keys, dial-in details, registration, recordings, attendance data, or Webex policies. Treat the attendee update as a new Teams join instruction and validate the Teams meeting policy separately.
 
-The script's default mode is `Preview`: it reads EWS items and reports candidates but does not create Graph meetings or change invitations. `Apply` creates/reuses the Teams meeting and updates the invite body and, when applicable, Location. `Rollback` restores the backed-up body and Location for items changed by this script and sends another update to attendees; it skips an item if either field differs from the saved post-apply value. A backup contains meeting body and Location content, so store it in an access-controlled location and delete it according to your retention rules after the POC.
+The script's default mode is `Preview`: it reads EWS items and reports candidates but does not create Graph meetings or change invitations. `Apply` creates/reuses the Teams meeting and updates the invite body and, when applicable, Location. `Rollback` restores the backed-up body and Location for items changed by this script and sends another update to attendees; it skips an item if either field differs from the saved post-apply value. Reports include detected Webex join URLs and parsed MTIDs, while backups contain meeting body and Location content; store both in an access-controlled location and delete them according to your retention rules after the POC.
 
 Use UTC timestamps for the scan window. Avoid meetings already in progress or close to their start. Have the test organizer run a real meeting with internal and external attendees and verify the join/lobby policy before broadening the pilot.
 
@@ -71,7 +71,7 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 1. Select 2–5 test organizers whose mailboxes are on-premises and who are enabled/licensed for Teams.
 2. Choose a future UTC scan window, for example the next 14 days.
 3. Use one-off test meetings first, then a simple recurring test series with at least two occurrences in the scan window. Include only meetings where the test mailbox is the organizer and where sending updates to attendees is acceptable.
-4. Create a protected working folder for the script, CSV, report, and backup. The backup stores original message bodies.
+4. Create a protected working folder for the script, CSV, report, and backup. Reports contain Webex join URLs and MTIDs; backups store original message bodies and Location text.
 
 ### Step 2 — Create and authorize the Graph app
 
@@ -253,7 +253,7 @@ Do not pass the EWS service account credential as a proxy credential. If Direct 
   -ReportPath ".\preview.csv"
 ```
 
-Review each `WouldApply` and `WouldApplyRecurringSeries` row and the skip reasons. Check `OriginalWebexUrl` and `WebexUrlSource`. Confirm that a selected URL containing `MTID` is the actual join link (for example, a Webex `j.php?MTID=...` link). If the note says multiple variants share the same MTID, the script will replace all of those variants; other URLs with a different or no MTID remain untouched. Different MTID values or multiple URLs without an MTID require manual review. For recurring series, check `MeetingScope` and `HasModifiedOccurrences`. Preview never calls Graph.
+Review each `WouldApply` and `WouldApplyRecurringSeries` row and the skip reasons. Check `OriginalWebexUrl`, `WebexUrlSource`, and `WebexUrlDiagnostics`. The diagnostics list every detected URL with its body/location source and parsed MTID, including repeated matches; use this field to compare what EWS returned with the text in Outlook. Confirm that a selected URL containing `MTID` is the actual join link (for example, a Webex `j.php?MTID=...` link). If the note says multiple variants share the same MTID, the script will replace all of those variants; other URLs with a different or no MTID remain untouched. Different MTID values or multiple URLs without an MTID require manual review. For recurring series, check `MeetingScope` and `HasModifiedOccurrences`. Preview never calls Graph.
 
 ### Step 8 — Apply to the smallest possible sample
 
@@ -314,7 +314,7 @@ Restore the attributes from the exported file by setting each mailbox's prior `C
 - If Preview reports `Cannot find an overload for "Bind"` or `Cannot find an overload for "Load"`, use the current script version. `PropertySet` implements `IEnumerable`; the helper preserves it as one object so PowerShell does not expand its contents into separate arguments. [Appointment.Bind overloads](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.appointment.bind?view=exchange-ews-api), [EWS PropertySet source](https://github.com/OfficeDev/ews-managed-api/blob/master/Core/PropertySet.cs)
 - If an older script rejects `-WindowStartUtc` or `-WindowEndUtc` even though the values end in `Z`, use the current script version, which accepts `DateTimeOffset` parameters. Avoid removing the `Z` and applying `[DateTime]::SpecifyKind` unless the clock values are already UTC; `SpecifyKind` labels a value and does not convert a local time to UTC.
 - Graph API `createOrGet` uses a deterministic external ID derived from organizer, iCalendar UID, and start time. For a recurring series, it uses the recurring master's start time for a stable series ID while setting the Graph meeting time to the occurrence in the scan window. This makes retries idempotent for the same single event or recurring series.
-- The script scans the body and Location field for URLs matching `webex.com` or `webex.eu`. It groups URL variants with the same `MTID` value and replaces those variants together. Different MTID values, or multiple candidates without an MTID, require manual review. Other links with different or no MTID remain unchanged. Inspect the report's `WebexUrlSource` column and review custom dial-in content manually.
+- The script scans the body and Location field for URLs matching `webex.com` or `webex.eu`. It groups URL variants with the same `MTID` value and replaces those variants together. Different MTID values, or multiple candidates without an MTID, require manual review. Other links with different or no MTID remain unchanged. Inspect the report's `WebexUrlSource` and `WebexUrlDiagnostics` columns and review custom dial-in content manually.
 - Graph app access policy authorizes the meeting API for the user. It does not grant EWS permissions. The EWS role assignment and the Graph app policy are separate controls.
 - Do not use Graph Calendar API to read/write these on-premises mailbox events. The standard Outlook calendar Graph APIs are for mailbox data stored in Exchange Online. Here, Graph is used only for Teams meeting generation; EWS owns the on-premises calendar item. [Graph Outlook calendar data scope](https://learn.microsoft.com/en-us/graph/outlook-calendar-concept-overview)
 
