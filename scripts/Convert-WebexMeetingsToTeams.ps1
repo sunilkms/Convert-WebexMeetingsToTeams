@@ -229,7 +229,8 @@ function New-DetailPropertySet {
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ICalUid,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ModifiedOccurrences
     ) | ForEach-Object { $props.Add($_) }
-    return $props
+    # PropertySet implements IEnumerable; the unary comma prevents PowerShell from unrolling it.
+    return ,$props
 }
 
 if (-not (Test-Path -LiteralPath $EwsManagedApiDll -PathType Leaf)) {
