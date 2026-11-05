@@ -224,19 +224,26 @@ The helper signs in interactively with delegated, read-only `User.ReadBasic.All`
 
 ### Step 7 — Preview
 
-Open Windows PowerShell 5.1 on the runner. Use a UTC start/end (include `Z`). Supply the EWS service credential interactively; do not save its password in a file.
+Open Windows PowerShell 5.1 on the runner. Use ISO 8601 UTC start/end values ending in `Z`. The script accepts these as `DateTimeOffset` values and converts them to UTC for EWS. On the first run, it prompts for the EWS service credential and saves it as a DPAPI-encrypted CLIXML file under `%LOCALAPPDATA%\WebexTeamsPOC\ews-credential.xml`; subsequent runs reuse that file without prompting.
+
+The cached credential can be decrypted only by the same Windows user on the same computer that created it. Run the script consistently under that account. If the service account password changes or you need to replace the cached credential, remove the file and run the script again to be prompted:
 
 ```powershell
-$ewsCredential = Get-Credential "CONTOSO\svc_webex_teams_poc"
+Remove-Item -LiteralPath "$env:LOCALAPPDATA\WebexTeamsPOC\ews-credential.xml"
+```
 
+To use a different cache location, pass `-EwsCredentialPath "<path>"`. The cache remains tied to the same Windows account and computer. Microsoft documents that `Export-Clixml` encrypts credentials with Windows DPAPI and that the exported credential cannot be used by a different user or computer. [Export-Clixml credential encryption](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/export-clixml?view=powershell-5.1)
+
+For automatic cache use, omit `-EwsCredential` and any separate `$ewsCredential = Get-Credential` line from the command. Supplying `-EwsCredential` explicitly overrides the cache.
+
+```powershell
 .\scripts\Convert-WebexMeetingsToTeams.ps1 `
   -Mode Preview `
   -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
   -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -EwsCredential $ewsCredential `
   -TargetsCsv ".\targets.csv" `
-  -WindowStartUtc "2026-11-03T00:00:00Z" `
-  -WindowEndUtc "2026-11-17T00:00:00Z" `
+  -WindowStartUtc "2026-11-05T00:00:00Z" `
+  -WindowEndUtc "2026-11-20T00:00:00Z" `
   -ReportPath ".\preview.csv"
 ```
 
@@ -252,14 +259,13 @@ Review each `WouldApply` and `WouldApplyRecurringSeries` row and the skip reason
      -Mode Apply `
      -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
      -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-     -EwsCredential $ewsCredential `
      -TargetsCsv ".\targets-one.csv" `
-     -WindowStartUtc "2026-11-03T00:00:00Z" `
-     -WindowEndUtc "2026-11-17T00:00:00Z" `
+     -WindowStartUtc "2026-11-05T00:00:00Z" `
+     -WindowEndUtc "2026-11-20T00:00:00Z" `
      -GraphTenantId "<TENANT-ID>" `
      -GraphAppId "<GRAPH-APP-CLIENT-ID>" `
      -GraphCertificateThumbprint "<CERTIFICATE-THUMBPRINT>" `
-     -BackupPath ".\teams-poc-backup-20261102-120000.jsonl" `
+     -BackupPath ".\teams-poc-backup-20261105-120000.jsonl" `
      -ReportPath ".\apply.csv"
    ```
 
@@ -281,7 +287,6 @@ Run the script in `Rollback` mode against the JSONL backup created by `Apply`. I
   -Mode Rollback `
   -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
   -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -EwsCredential $ewsCredential `
   -BackupPath ".\teams-poc-backup-YYYYMMDD-HHMMSS.jsonl" `
   -ReportPath ".\rollback.csv"
 ```
@@ -299,6 +304,8 @@ Restore the attributes from the exported file by setting each mailbox's prior `C
 ## 6. Script files and execution notes
 
 - Script: [scripts/Convert-WebexMeetingsToTeams.ps1](scripts/Convert-WebexMeetingsToTeams.ps1)
+- If Preview reports `MailboxError` with `'TimeZone' is a ReadOnly property.`, use the current script version: EWS time zone is supplied to the `ExchangeService(ExchangeVersion, TimeZoneInfo)` constructor. The `TimeZone` property is read-only. [ExchangeService constructors and properties](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.exchangeservice?view=exchange-ews-api)
+- If an older script rejects `-WindowStartUtc` or `-WindowEndUtc` even though the values end in `Z`, use the current script version, which accepts `DateTimeOffset` parameters. Avoid removing the `Z` and applying `[DateTime]::SpecifyKind` unless the clock values are already UTC; `SpecifyKind` labels a value and does not convert a local time to UTC.
 - Graph API `createOrGet` uses a deterministic external ID derived from organizer, iCalendar UID, and start time. For a recurring series, it uses the recurring master's start time for a stable series ID while setting the Graph meeting time to the occurrence in the scan window. This makes retries idempotent for the same single event or recurring series.
 - The script requires exactly one URL matching `webex.com` or `webex.eu` in the body. If an invite contains several Webex URLs or custom dial-in content, review and migrate that item manually.
 - Graph app access policy authorizes the meeting API for the user. It does not grant EWS permissions. The EWS role assignment and the Graph app policy are separate controls.

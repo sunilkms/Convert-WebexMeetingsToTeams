@@ -9,12 +9,13 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $EwsManagedApiDll,
 
-    [Parameter(Mandatory = $true)]
     [System.Management.Automation.PSCredential] $EwsCredential,
 
+    [string] $EwsCredentialPath = (Join-Path $env:LOCALAPPDATA 'WebexTeamsPOC\ews-credential.xml'),
+
     [string] $TargetsCsv,
-    [datetime] $WindowStartUtc,
-    [datetime] $WindowEndUtc,
+    [datetimeoffset] $WindowStartUtc,
+    [datetimeoffset] $WindowEndUtc,
 
     [string] $GraphTenantId,
     [string] $GraphAppId,
@@ -52,10 +53,10 @@ function New-EwsService {
 
     $networkCredential = $Credential.GetNetworkCredential()
     $service = [Microsoft.Exchange.WebServices.Data.ExchangeService]::new(
-        [Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1
+        [Microsoft.Exchange.WebServices.Data.ExchangeVersion]::Exchange2013_SP1,
+        [TimeZoneInfo]::Utc
     )
     $service.Url = $Endpoint
-    $service.TimeZone = [TimeZoneInfo]::Utc
     $service.Credentials = [Microsoft.Exchange.WebServices.Data.WebCredentials]::new(
         $networkCredential.UserName,
         $networkCredential.Password,
@@ -67,6 +68,56 @@ function New-EwsService {
     )
     $service.HttpHeaders.Add('X-AnchorMailbox', $MailboxSmtp)
     return $service
+}
+
+function Resolve-EwsCredential {
+    param(
+        [System.Management.Automation.PSCredential] $Credential,
+        [Parameter(Mandatory = $true)][string] $CredentialPath
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw 'The encrypted EWS credential cache requires Windows DPAPI. Run this script on Windows PowerShell on Windows.'
+    }
+    if ($Credential) {
+        return $Credential
+    }
+    if ([string]::IsNullOrWhiteSpace($CredentialPath)) {
+        throw 'EwsCredentialPath cannot be empty.'
+    }
+
+    $credentialFullPath = [System.IO.Path]::GetFullPath($CredentialPath)
+    if (Test-Path -LiteralPath $credentialFullPath -PathType Leaf) {
+        try {
+            $savedCredential = Import-Clixml -LiteralPath $credentialFullPath -ErrorAction Stop
+        }
+        catch {
+            throw "Could not decrypt the saved EWS credential at '$credentialFullPath'. Run as the same Windows user on the same computer that created it, or remove the file and rerun to save a replacement. Details: $($_.Exception.Message)"
+        }
+        if ($savedCredential -isnot [System.Management.Automation.PSCredential]) {
+            throw "The saved file '$credentialFullPath' does not contain a PowerShell credential. Remove it and rerun the script to create a new encrypted credential file."
+        }
+        return $savedCredential
+    }
+
+    $newCredential = Get-Credential -Message 'Enter the EWS service account credential. It will be saved encrypted for this Windows account and computer.'
+    if (-not $newCredential) {
+        throw 'No EWS credential was supplied.'
+    }
+
+    $credentialDirectory = Split-Path -Path $credentialFullPath -Parent
+    if ($credentialDirectory -and -not (Test-Path -LiteralPath $credentialDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $credentialDirectory -Force | Out-Null
+    }
+    try {
+        $newCredential | Export-Clixml -Path $credentialFullPath -Force -ErrorAction Stop
+    }
+    catch {
+        throw "Could not save the encrypted EWS credential to '$credentialFullPath'. Details: $($_.Exception.Message)"
+    }
+
+    Write-Host "Encrypted EWS credential saved to: $credentialFullPath"
+    return $newCredential
 }
 
 function New-TeamsExternalId {
@@ -175,6 +226,7 @@ $endpointUri = [uri]$EwsUrl
 if ($endpointUri.Scheme -ne 'https') {
     throw 'EWS URL must use HTTPS.'
 }
+$EwsCredential = Resolve-EwsCredential -Credential $EwsCredential -CredentialPath $EwsCredentialPath
 
 $detailProps = New-DetailPropertySet
 $report = New-Object System.Collections.Generic.List[object]
@@ -223,12 +275,10 @@ else {
     if (-not $TargetsCsv -or -not (Test-Path -LiteralPath $TargetsCsv -PathType Leaf)) {
         throw "Targets CSV not found: $TargetsCsv"
     }
-    if ($WindowStartUtc -eq [datetime]::MinValue -or
-        $WindowEndUtc -eq [datetime]::MinValue -or
-        $WindowStartUtc.Kind -ne [DateTimeKind]::Utc -or
-        $WindowEndUtc.Kind -ne [DateTimeKind]::Utc -or
+    if ($WindowStartUtc -eq [datetimeoffset]::MinValue -or
+        $WindowEndUtc -eq [datetimeoffset]::MinValue -or
         $WindowEndUtc -le $WindowStartUtc) {
-        throw 'Provide a valid -WindowStartUtc and -WindowEndUtc. Use UTC timestamps (for example, 2026-11-03T00:00:00Z).'
+        throw 'Provide a valid -WindowStartUtc and -WindowEndUtc. Use UTC timestamps (for example, 2026-11-05T00:00:00Z).'
     }
 
     $targets = @(Import-Csv -LiteralPath $TargetsCsv)
@@ -265,8 +315,8 @@ else {
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::ICalUid
     ) | ForEach-Object { $findProps.Add($_) }
 
-    $startUtc = [DateTime]::SpecifyKind($WindowStartUtc, [DateTimeKind]::Utc)
-    $endUtc = [DateTime]::SpecifyKind($WindowEndUtc, [DateTimeKind]::Utc)
+    $startUtc = $WindowStartUtc.UtcDateTime
+    $endUtc = $WindowEndUtc.UtcDateTime
     $view = [Microsoft.Exchange.WebServices.Data.CalendarView]::new($startUtc, $endUtc, 1000)
     $view.PropertySet = $findProps
 

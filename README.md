@@ -34,7 +34,7 @@ The recurring series uses a standalone Graph meeting object. Microsoft documents
 | --- | --- |
 | `README.md` | Project overview and quick-start guidance. |
 | `POC-Webex-to-Teams-Meeting-URL.md` | Detailed requirements, permission setup, Exchange scoping, runbook, validation steps, and rollback instructions. |
-| `scripts/Convert-WebexMeetingsToTeams.ps1` | Script with `Preview`, `Apply`, and `Rollback` modes. |
+| `scripts/Convert-WebexMeetingsToTeams.ps1` | Script with `Preview`, `Apply`, and `Rollback` modes and a Windows encrypted EWS credential cache. |
 | `scripts/New-TargetsCsv.ps1` | Resolves pilot SMTP addresses to Entra object IDs and writes `targets.csv`. |
 | `pilot-mailboxes.csv` | Input template for pilot mailbox SMTP addresses and optional Entra UPNs. |
 | `targets.csv` | Output template consumed by the meeting conversion script. |
@@ -46,6 +46,7 @@ The recurring series uses a standalone Graph meeting object. Microsoft documents
 - A single-tenant Entra app registration with a certificate and Microsoft Graph **application** permission `OnlineMeetings.ReadWrite.All`, with admin consent.
 - For the POC, create a self-signed certificate in `Cert:\CurrentUser\My` while signed in as the Windows account that will run the script; upload only its public `.cer` to the app registration and pass its thumbprint to the script. The detailed generation, upload, and app-only connection check are in [the runbook](POC-Webex-to-Teams-Meeting-URL.md). Use your organization's PKI process for production.
 - A Teams application access policy assigned only to pilot organizers. Graph requires this policy when application permission is used to create meetings on behalf of users.
+- The EWS credential cache uses Windows DPAPI through `Export-Clixml`. The first run prompts once and saves it under `%LOCALAPPDATA%\WebexTeamsPOC\ews-credential.xml`; later runs must use the same Windows account on the same computer. [Microsoft Export-Clixml credential encryption](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/export-clixml?view=powershell-5.1)
 - To generate the target list, an interactive delegated Graph lookup using `User.ReadBasic.All`. This read-only permission is used only by the helper script, not by the POC meeting creation app. [Graph list users permissions](https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0)
 - Pilot organizers synchronized to Entra ID and enabled/licensed for Teams.
 - Windows PowerShell 5.1, the approved EWS Managed API 2.2 assembly, and the `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users` modules.
@@ -74,19 +75,16 @@ First, follow the detailed [POC runbook](POC-Webex-to-Teams-Meeting-URL.md) to r
 
 ### Preview
 
-Preview reads meetings and writes a report. It does not call Graph or update Exchange.
+Preview reads meetings and writes a report. It does not call Graph or update Exchange. The first run prompts for the EWS credential and saves it encrypted; later runs reuse that cache. See the credential-cache note in the runbook if the password changes or the script will run under a different Windows account.
 
 ```powershell
-$ewsCredential = Get-Credential "CONTOSO\svc_webex_teams_poc"
-
 .\scripts\Convert-WebexMeetingsToTeams.ps1 `
   -Mode Preview `
   -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
   -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -EwsCredential $ewsCredential `
   -TargetsCsv ".\targets.csv" `
-  -WindowStartUtc "2026-11-03T00:00:00Z" `
-  -WindowEndUtc "2026-11-17T00:00:00Z" `
+  -WindowStartUtc "2026-11-05T00:00:00Z" `
+  -WindowEndUtc "2026-11-20T00:00:00Z" `
   -ReportPath ".\preview.csv"
 ```
 
@@ -99,14 +97,13 @@ After reviewing the preview, use a one-organizer CSV for the first apply. Add th
   -Mode Apply `
   -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
   -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -EwsCredential $ewsCredential `
   -TargetsCsv ".\targets-one.csv" `
-  -WindowStartUtc "2026-11-03T00:00:00Z" `
-  -WindowEndUtc "2026-11-17T00:00:00Z" `
+  -WindowStartUtc "2026-11-05T00:00:00Z" `
+  -WindowEndUtc "2026-11-20T00:00:00Z" `
   -GraphTenantId "<TENANT-ID>" `
   -GraphAppId "<GRAPH-APP-CLIENT-ID>" `
   -GraphCertificateThumbprint "<CERTIFICATE-THUMBPRINT>" `
-  -BackupPath ".\teams-poc-backup-20261102-120000.jsonl" `
+  -BackupPath ".\teams-poc-backup-20261105-120000.jsonl" `
   -ReportPath ".\apply.csv"
 ```
 
@@ -119,8 +116,7 @@ Rollback restores the original meeting body from the JSONL backup and sends anot
   -Mode Rollback `
   -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
   -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -EwsCredential $ewsCredential `
-  -BackupPath ".\teams-poc-backup-20261102-120000.jsonl" `
+  -BackupPath ".\teams-poc-backup-20261105-120000.jsonl" `
   -ReportPath ".\rollback.csv"
 ```
 
