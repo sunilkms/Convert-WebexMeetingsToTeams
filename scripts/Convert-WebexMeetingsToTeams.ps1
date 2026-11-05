@@ -182,20 +182,40 @@ function Get-TeamsJoinUrl {
 function Get-NewBodyText {
     param(
         [Parameter(Mandatory = $true)][string] $OriginalBody,
-        [Parameter(Mandatory = $true)][string] $OriginalUrl,
+        [Parameter(Mandatory = $true)][string[]] $OriginalUrls,
         [Parameter(Mandatory = $true)][string] $TeamsUrl,
         [Parameter(Mandatory = $true)][Microsoft.Exchange.WebServices.Data.BodyType] $BodyType
     )
 
     if ($BodyType -eq [Microsoft.Exchange.WebServices.Data.BodyType]::HTML) {
         $safeTeamsUrl = [System.Security.SecurityElement]::Escape($TeamsUrl)
-        $updated = $OriginalBody.Replace($OriginalUrl, $safeTeamsUrl)
+        $updated = $OriginalBody
+        foreach ($originalUrl in $OriginalUrls) {
+            $updated = $updated.Replace($originalUrl, $safeTeamsUrl)
+        }
         $banner = '<div><p><strong>Join Microsoft Teams meeting:</strong> <a href="{0}">Join the meeting now</a></p></div><hr />' -f $safeTeamsUrl
         return $banner + $updated
     }
 
-    $updated = $OriginalBody.Replace($OriginalUrl, $TeamsUrl)
+    $updated = $OriginalBody
+    foreach ($originalUrl in $OriginalUrls) {
+        $updated = $updated.Replace($originalUrl, $TeamsUrl)
+    }
     return "Join Microsoft Teams meeting: $TeamsUrl`r`n`r`n$updated"
+}
+
+function Get-WebexMtidValue {
+    param([Parameter(Mandatory = $true)][string] $Url)
+
+    $decodedUrl = [System.Net.WebUtility]::HtmlDecode($Url)
+    $mtidMatch = [regex]::Match($decodedUrl, '(?i)(?:[?&])MTID=([^&;#\s]+)')
+    if (-not $mtidMatch.Success) {
+        $mtidMatch = [regex]::Match($Url, '(?i)(?:[?&](?:amp;)?|%3f|%26)MTID(?:=|%3d)([^&;#\s]+)')
+    }
+    if ($mtidMatch.Success) {
+        return [string]$mtidMatch.Groups[1].Value.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']')
+    }
+    return ''
 }
 
 function New-BodyValue {
@@ -507,7 +527,7 @@ else {
                         $webexUrlsByValue[$candidateUrl.Url] = [pscustomobject]@{
                             Url = $candidateUrl.Url
                             Sources = $sources
-                            HasMtid = $candidateUrl.Url -match '(?i)(?:[?&](?:amp;)?)MTID='
+                            MtidValue = Get-WebexMtidValue -Url $candidateUrl.Url
                         }
                     }
                 }
@@ -517,27 +537,49 @@ else {
                     $report.Add([pscustomobject]$base); continue
                 }
 
-                $mtidUrls = @($uniqueWebexUrls | Where-Object { $_.HasMtid })
-                if ($mtidUrls.Count -gt 1) {
+                $distinctMtidValues = New-Object System.Collections.Generic.List[string]
+                foreach ($webexUrl in $uniqueWebexUrls) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$webexUrl.MtidValue) -and -not $distinctMtidValues.Contains([string]$webexUrl.MtidValue)) {
+                        $distinctMtidValues.Add([string]$webexUrl.MtidValue)
+                    }
+                }
+                if ($distinctMtidValues.Count -gt 1) {
                     $base.Status = 'SkippedMultipleMtidWebex'
-                    $base.Note = "Found $($mtidUrls.Count) distinct Webex URLs with MTID; manual review required."
+                    $base.Note = "Found $($distinctMtidValues.Count) different MTID values; manual review required."
                     $report.Add([pscustomobject]$base); continue
                 }
 
-                if ($mtidUrls.Count -eq 1) {
-                    $selectedWebexUrl = $mtidUrls[0]
+                if ($distinctMtidValues.Count -eq 1) {
+                    $selectedMtidValue = $distinctMtidValues[0]
+                    $selectedWebexUrls = @($uniqueWebexUrls | Where-Object { $_.MtidValue -ceq $selectedMtidValue })
                 }
                 elseif ($uniqueWebexUrls.Count -eq 1) {
-                    $selectedWebexUrl = $uniqueWebexUrls[0]
+                    $selectedWebexUrls = @($uniqueWebexUrls[0])
                 }
                 else {
                     $base.Status = 'SkippedMultipleWebex'
-                    $base.Note = "Found $($uniqueWebexUrls.Count) distinct Webex URLs and none has a unique MTID; manual review required."
+                    $base.Note = "Found $($uniqueWebexUrls.Count) distinct Webex URLs and none has an MTID; manual review required."
                     $report.Add([pscustomobject]$base); continue
                 }
 
+                $selectedWebexUrl = $selectedWebexUrls[0]
                 $oldUrl = [string]$selectedWebexUrl.Url
-                $webexUrlSource = $selectedWebexUrl.Sources.ToArray() -join '+'
+                $selectedWebexUrlValues = @($selectedWebexUrls | ForEach-Object { [string]$_.Url } | Sort-Object Length -Descending)
+                $selectedSources = New-Object System.Collections.Generic.List[string]
+                foreach ($selectedUrl in $selectedWebexUrls) {
+                    foreach ($source in $selectedUrl.Sources) {
+                        if (-not $selectedSources.Contains($source)) { $selectedSources.Add($source) }
+                    }
+                }
+                $webexUrlSource = $selectedSources.ToArray() -join '+'
+                $selectionNote = ''
+                if ($selectedWebexUrls.Count -gt 1) {
+                    $selectionNote += " Found $($selectedWebexUrls.Count) URL variants sharing the same MTID; all selected variants will be replaced."
+                }
+                $otherUrlCount = $uniqueWebexUrls.Count - $selectedWebexUrls.Count
+                if ($otherUrlCount -gt 0) {
+                    $selectionNote += " Left $otherUrlCount other Webex URL(s) with a different or no MTID untouched."
+                }
                 $base.OriginalWebexUrl = $oldUrl
                 $base.WebexUrlSource = $webexUrlSource
                 if ([string]::IsNullOrWhiteSpace([string]$appointment.ICalUid)) {
@@ -548,10 +590,7 @@ else {
                 if ($Mode -eq 'Preview') {
                     $base.Status = if ($base.MeetingScope -eq 'RecurringSeries') { 'WouldApplyRecurringSeries' } else { 'WouldApply' }
                     $base.Note = 'Preview only; Graph was not called and Exchange was not changed.'
-                    if ($mtidUrls.Count -eq 1 -and $uniqueWebexUrls.Count -gt 1) {
-                        $otherUrlCount = $uniqueWebexUrls.Count - 1
-                        $base.Note += " Selected the unique MTID URL from $webexUrlSource; left $otherUrlCount other Webex URL(s) untouched."
-                    }
+                    $base.Note += $selectionNote
                     if ($base.HasModifiedOccurrences) {
                         $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
                     }
@@ -565,19 +604,19 @@ else {
                     $base.TeamsJoinUrl = $teamsUrl
 
                     $bodyType = $appointment.Body.BodyType
-                    $newBodyText = Get-NewBodyText -OriginalBody $bodyText -OriginalUrl $oldUrl `
+                    $newBodyText = Get-NewBodyText -OriginalBody $bodyText -OriginalUrls $selectedWebexUrlValues `
                         -TeamsUrl $teamsUrl -BodyType $bodyType
-                    $newLocationText = $locationText.Replace($oldUrl, $teamsUrl)
+                    $newLocationText = $locationText
+                    foreach ($selectedUrl in $selectedWebexUrlValues) {
+                        $newLocationText = $newLocationText.Replace($selectedUrl, $teamsUrl)
+                    }
                     $base.Status = 'ReadyToApply'
                     $base.Note = if ($base.MeetingScope -eq 'RecurringSeries') {
                         'Graph meeting created or reused. The recurring master is updated so the series uses one shared Teams join URL.'
                     } else {
                         'Graph meeting created or reused. The Teams join URL is added to the body and the selected Webex URL is replaced.'
                     }
-                    if ($mtidUrls.Count -eq 1 -and $uniqueWebexUrls.Count -gt 1) {
-                        $otherUrlCount = $uniqueWebexUrls.Count - 1
-                        $base.Note += " Selected the unique MTID URL from $webexUrlSource; left $otherUrlCount other Webex URL(s) untouched."
-                    }
+                    $base.Note += $selectionNote
                     if ($base.HasModifiedOccurrences) {
                         $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
                     }
@@ -616,10 +655,7 @@ else {
                     } else {
                         $base.Note = 'Updated in Exchange; meeting update sent to all attendees. Review link label and invite content.'
                     }
-                    if ($mtidUrls.Count -eq 1 -and $uniqueWebexUrls.Count -gt 1) {
-                        $otherUrlCount = $uniqueWebexUrls.Count - 1
-                        $base.Note += " Selected the unique MTID URL from $webexUrlSource; left $otherUrlCount other Webex URL(s) untouched."
-                    }
+                    $base.Note += $selectionNote
                 }
                 catch {
                     $base.Status = 'ApplyError'
