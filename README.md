@@ -6,10 +6,10 @@ This project is a proof of concept for replacing Webex join links in selected me
 
 The PowerShell script uses two services:
 
-1. **Exchange Web Services (EWS)** reads the organizer's on-premises calendar and updates eligible meeting bodies.
+1. **Exchange Web Services (EWS)** reads the organizer's on-premises calendar and updates eligible meeting bodies and, when the join link is there, the Location field.
 2. **Microsoft Graph** creates or retrieves a Teams online meeting for the organizer and returns its join URL.
 
-The script inserts the Teams join link into the existing invite, replaces the single detected Webex URL, and sends an updated meeting request to attendees.
+The script inserts the Teams join link into the existing invite, replaces the selected Webex URL in the body and/or Location field, and sends an updated meeting request to attendees.
 
 ```mermaid
 flowchart LR
@@ -24,7 +24,7 @@ flowchart LR
 
 Graph's `onlineMeeting:createOrGet` creates a standalone meeting that does not appear on the organizer's calendar. The script updates the existing on-prem Exchange event separately through EWS. This POC therefore changes the invitation's join instructions; it does not create a fully calendar-backed Teams meeting or migrate Webex meeting IDs, dial-in details, registration, recordings, attendance data, or policies. See [Microsoft Graph `createOrGet`](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-createorget?view=graph-rest-1.0).
 
-The included script processes organizer-owned, non-cancelled single meetings and recurring series with exactly one Webex URL in the item's body. For a recurring series, it binds to and updates the series master once, so the series uses one shared Teams URL. It skips attendee copies, events with multiple or no Webex URLs, and events that already contain a Teams join URL. A modified occurrence (an exception) can have its own invite body; the script flags such series but does not rewrite exception bodies independently. Review those exceptions manually after applying, along with generated invite content and any Webex-specific instructions that remain in the body.
+The included script processes organizer-owned, non-cancelled single meetings and recurring series. It scans both the item body and Location field. If it finds one unique Webex URL with an `MTID` query parameter, it selects that link even when other Webex URLs are present; other URLs are left untouched. Otherwise, it proceeds only when there is exactly one distinct Webex URL across those fields. The preview report's `WebexUrlSource` column identifies whether the selected link came from `Body`, `Location`, or both. For a recurring series, it binds to and updates the series master once, so the series uses one shared Teams URL. It skips attendee copies, items without a Webex URL, ambiguous multiple-link items, and events that already contain a Teams join URL. A modified occurrence (an exception) can have its own invite body; the script flags such series but does not rewrite exception bodies independently. Review those exceptions manually after applying, along with generated invite content and any Webex-specific instructions that remain.
 
 The recurring series uses a standalone Graph meeting object. Microsoft documents a 60-day expiry after the meeting start/end that can be extended by updating or activating the meeting before expiry. Validate long recurring gaps over 60 days separately; they may require a refreshed link. [Graph onlineMeeting lifetime](https://learn.microsoft.com/en-us/graph/api/resources/onlinemeeting?view=graph-rest-1.0)
 
@@ -91,7 +91,7 @@ Preview reads meetings and writes a report. It does not call Graph or update Exc
 
 ### Apply
 
-After reviewing the preview, use a one-organizer CSV for the first apply. Add the Graph tenant ID, app client ID, certificate thumbprint, and a new backup path. The script creates/reuses the Teams meeting, backs up the original invite body, updates Exchange, and sends the attendee update.
+After reviewing the preview, use a one-organizer CSV for the first apply. Add the Graph tenant ID, app client ID, certificate thumbprint, and a new backup path. The script creates/reuses the Teams meeting, backs up the original invite body and Location, updates Exchange, and sends the attendee update.
 
 ```powershell
 .\scripts\Convert-WebexMeetingsToTeams.ps1 `
@@ -110,7 +110,7 @@ After reviewing the preview, use a one-organizer CSV for the first apply. Add th
 
 ### Rollback
 
-Rollback restores the original meeting body from the JSONL backup and sends another meeting update. It does not delete the standalone Teams online meeting object. Protect the backup because it contains original meeting body text.
+Rollback restores the original meeting body and Location from the JSONL backup and sends another meeting update. It skips restoration if either field no longer matches the script's saved post-apply value. It does not delete the standalone Teams online meeting object. Protect the backup because it contains original meeting text and Location.
 
 ```powershell
 .\scripts\Convert-WebexMeetingsToTeams.ps1 `
@@ -124,7 +124,7 @@ Rollback restores the original meeting body from the JSONL backup and sends anot
 ## Validation checklist
 
 1. Start with one organizer and one future, single-instance meeting with a test attendee.
-2. Review the `Preview` report and confirm the intended Webex URL is the only match.
+2. Review the `Preview` report, especially `OriginalWebexUrl`, `WebexUrlSource`, and `Note`. Confirm that a selected MTID URL is the intended join link and understand which other Webex URLs will remain untouched.
 3. Apply the change and confirm the Teams URL appears in the organizer's Exchange event.
 4. Confirm the attendee receives the updated invite and can join the Teams meeting.
 5. Repeat with a simple recurring series without modified occurrences and confirm the master update reaches multiple occurrences. If `HasModifiedOccurrences` is true, inspect and update each exception invite manually; the script only edits the recurring master.

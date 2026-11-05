@@ -221,6 +221,7 @@ function New-DetailPropertySet {
         [Microsoft.Exchange.WebServices.Data.ItemSchema]::Body,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::Start,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::End,
+        [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::Location,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::IsMeeting,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::IsCancelled,
         [Microsoft.Exchange.WebServices.Data.AppointmentSchema]::IsRecurring,
@@ -260,10 +261,13 @@ if ($Mode -eq 'Rollback') {
             $itemId = [Microsoft.Exchange.WebServices.Data.ItemId]::new([string]$record.ItemId)
             $appointment = [Microsoft.Exchange.WebServices.Data.Appointment]::Bind($service, $itemId)
             $appointment.Load($detailProps)
-            if ($appointment.Body.Text -cne [string]$record.NewBodyText) {
+            $locationWasBackedUp = $null -ne $record.PSObject.Properties['NewLocation']
+            $bodyMatchesBackup = $appointment.Body.Text -ceq [string]$record.NewBodyText
+            $locationMatchesBackup = (-not $locationWasBackedUp) -or ($appointment.Location -ceq [string]$record.NewLocation)
+            if (-not $bodyMatchesBackup -or -not $locationMatchesBackup) {
                 $report.Add([pscustomobject]@{
                     MailboxSmtp = $record.MailboxSmtp; Subject = $record.Subject; StartUtc = $record.StartUtc
-                    Status = 'RollbackSkippedBodyChanged'; Note = 'Current body no longer matches this script backup.'
+                    Status = 'RollbackSkippedChanged'; Note = 'Current body or location no longer matches this script backup.'
                 })
                 continue
             }
@@ -272,13 +276,16 @@ if ($Mode -eq 'Rollback') {
                 [Microsoft.Exchange.WebServices.Data.BodyType], [string]$record.OriginalBodyType, $true
             )
             $appointment.Body = New-BodyValue -BodyType $originalType -Text ([string]$record.OriginalBodyText)
+            if ($null -ne $record.PSObject.Properties['OriginalLocation']) {
+                $appointment.Location = [string]$record.OriginalLocation
+            }
             $appointment.Update(
                 [Microsoft.Exchange.WebServices.Data.ConflictResolutionMode]::AlwaysOverwrite,
                 [Microsoft.Exchange.WebServices.Data.SendInvitationsOrCancellationsMode]::SendToAllAndSaveCopy
             )
             $report.Add([pscustomobject]@{
                 MailboxSmtp = $record.MailboxSmtp; Subject = $record.Subject; StartUtc = $record.StartUtc
-                Status = 'RolledBack'; Note = 'Original body restored and attendee update sent.'
+                Status = 'RolledBack'; Note = 'Original body and location restored; attendee update sent.'
             })
         }
         catch {
@@ -360,6 +367,7 @@ else {
                     MeetingScope = 'Single'
                     HasModifiedOccurrences = $false
                     OriginalWebexUrl = ''
+                    WebexUrlSource = ''
                     TeamsJoinUrl = ''
                     Status = ''
                     Note = ''
@@ -463,23 +471,75 @@ else {
                 }
 
                 $bodyText = [string]$appointment.Body.Text
-                if ($bodyText -match '(?i)teams\.microsoft\.com/l/meetup-join') {
+                $locationText = [string]$appointment.Location
+                if (($bodyText + "`n" + $locationText) -match '(?i)teams\.microsoft\.com/l/meetup-join') {
                     $base.Status = 'SkippedAlreadyTeams'; $base.Note = 'A Teams join URL is already present.'
                     $report.Add([pscustomobject]$base); continue
                 }
 
-                $matches = [regex]::Matches($bodyText, $webexPattern)
-                if ($matches.Count -eq 0) {
-                    $base.Status = 'SkippedNoWebex'; $base.Note = 'No Webex URL found in the body.'
-                    $report.Add([pscustomobject]$base); continue
+                $webexCandidates = New-Object System.Collections.Generic.List[object]
+                foreach ($field in @(
+                    [pscustomobject]@{ Source = 'Body'; Text = $bodyText },
+                    [pscustomobject]@{ Source = 'Location'; Text = $locationText }
+                )) {
+                    foreach ($urlMatch in [regex]::Matches([string]$field.Text, $webexPattern)) {
+                        $candidateUrl = [string]$urlMatch.Value.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']')
+                        if (-not [string]::IsNullOrWhiteSpace($candidateUrl)) {
+                            $webexCandidates.Add([pscustomobject]@{ Url = $candidateUrl; Source = $field.Source })
+                        }
+                    }
                 }
-                if ($matches.Count -ne 1) {
-                    $base.Status = 'SkippedMultipleWebex'; $base.Note = "Found $($matches.Count) Webex URLs; manual review required."
+
+                # Deduplicate links repeated in the body and Location while retaining their source fields.
+                # Treat full URLs as case-sensitive so distinct meeting IDs are never collapsed.
+                $webexUrlsByValue = [System.Collections.Generic.Dictionary[string, object]]::new(
+                    [System.StringComparer]::Ordinal
+                )
+                foreach ($candidateUrl in $webexCandidates) {
+                    if ($webexUrlsByValue.ContainsKey($candidateUrl.Url)) {
+                        if (-not $webexUrlsByValue[$candidateUrl.Url].Sources.Contains($candidateUrl.Source)) {
+                            $webexUrlsByValue[$candidateUrl.Url].Sources.Add($candidateUrl.Source)
+                        }
+                    }
+                    else {
+                        $sources = New-Object System.Collections.Generic.List[string]
+                        $sources.Add($candidateUrl.Source)
+                        $webexUrlsByValue[$candidateUrl.Url] = [pscustomobject]@{
+                            Url = $candidateUrl.Url
+                            Sources = $sources
+                            HasMtid = $candidateUrl.Url -match '(?i)(?:[?&](?:amp;)?)MTID='
+                        }
+                    }
+                }
+                $uniqueWebexUrls = @($webexUrlsByValue.Values)
+                if ($uniqueWebexUrls.Count -eq 0) {
+                    $base.Status = 'SkippedNoWebex'; $base.Note = 'No Webex URL found in body or location.'
                     $report.Add([pscustomobject]$base); continue
                 }
 
-                $oldUrl = [string]$matches[0].Value.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']')
+                $mtidUrls = @($uniqueWebexUrls | Where-Object { $_.HasMtid })
+                if ($mtidUrls.Count -gt 1) {
+                    $base.Status = 'SkippedMultipleMtidWebex'
+                    $base.Note = "Found $($mtidUrls.Count) distinct Webex URLs with MTID; manual review required."
+                    $report.Add([pscustomobject]$base); continue
+                }
+
+                if ($mtidUrls.Count -eq 1) {
+                    $selectedWebexUrl = $mtidUrls[0]
+                }
+                elseif ($uniqueWebexUrls.Count -eq 1) {
+                    $selectedWebexUrl = $uniqueWebexUrls[0]
+                }
+                else {
+                    $base.Status = 'SkippedMultipleWebex'
+                    $base.Note = "Found $($uniqueWebexUrls.Count) distinct Webex URLs and none has a unique MTID; manual review required."
+                    $report.Add([pscustomobject]$base); continue
+                }
+
+                $oldUrl = [string]$selectedWebexUrl.Url
+                $webexUrlSource = $selectedWebexUrl.Sources.ToArray() -join '+'
                 $base.OriginalWebexUrl = $oldUrl
+                $base.WebexUrlSource = $webexUrlSource
                 if ([string]::IsNullOrWhiteSpace([string]$appointment.ICalUid)) {
                     $base.Status = 'SkippedNoICalUid'; $base.Note = 'No iCalendar UID; stable meeting identity cannot be generated.'
                     $report.Add([pscustomobject]$base); continue
@@ -488,6 +548,10 @@ else {
                 if ($Mode -eq 'Preview') {
                     $base.Status = if ($base.MeetingScope -eq 'RecurringSeries') { 'WouldApplyRecurringSeries' } else { 'WouldApply' }
                     $base.Note = 'Preview only; Graph was not called and Exchange was not changed.'
+                    if ($mtidUrls.Count -eq 1 -and $uniqueWebexUrls.Count -gt 1) {
+                        $otherUrlCount = $uniqueWebexUrls.Count - 1
+                        $base.Note += " Selected the unique MTID URL from $webexUrlSource; left $otherUrlCount other Webex URL(s) untouched."
+                    }
                     if ($base.HasModifiedOccurrences) {
                         $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
                     }
@@ -503,11 +567,16 @@ else {
                     $bodyType = $appointment.Body.BodyType
                     $newBodyText = Get-NewBodyText -OriginalBody $bodyText -OriginalUrl $oldUrl `
                         -TeamsUrl $teamsUrl -BodyType $bodyType
+                    $newLocationText = $locationText.Replace($oldUrl, $teamsUrl)
                     $base.Status = 'ReadyToApply'
                     $base.Note = if ($base.MeetingScope -eq 'RecurringSeries') {
                         'Graph meeting created or reused. The recurring master is updated so the series uses one shared Teams join URL.'
                     } else {
-                        'Graph meeting created or reused. The Teams join URL is prepended and the sole Webex URL is replaced.'
+                        'Graph meeting created or reused. The Teams join URL is added to the body and the selected Webex URL is replaced.'
+                    }
+                    if ($mtidUrls.Count -eq 1 -and $uniqueWebexUrls.Count -gt 1) {
+                        $otherUrlCount = $uniqueWebexUrls.Count - 1
+                        $base.Note += " Selected the unique MTID URL from $webexUrlSource; left $otherUrlCount other Webex URL(s) untouched."
                     }
                     if ($base.HasModifiedOccurrences) {
                         $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
@@ -523,6 +592,8 @@ else {
                         OriginalBodyType = [string]$bodyType
                         OriginalBodyText = $bodyText
                         NewBodyText = $newBodyText
+                        OriginalLocation = $locationText
+                        NewLocation = $newLocationText
                         OriginalWebexUrl = $oldUrl
                         TeamsJoinUrl = $teamsUrl
                     }
@@ -532,6 +603,9 @@ else {
                     Write-JsonLine -Object $backup -Path $BackupPath
 
                     $appointment.Body = New-BodyValue -BodyType $bodyType -Text $newBodyText
+                    if ($newLocationText -cne $locationText) {
+                        $appointment.Location = $newLocationText
+                    }
                     $appointment.Update(
                         [Microsoft.Exchange.WebServices.Data.ConflictResolutionMode]::AlwaysOverwrite,
                         [Microsoft.Exchange.WebServices.Data.SendInvitationsOrCancellationsMode]::SendToAllAndSaveCopy
@@ -541,6 +615,10 @@ else {
                         $base.Note = 'Updated recurring master; EWS sent a meeting update for the series. This script does not rewrite exception bodies independently; verify and manually update each modified occurrence invite.'
                     } else {
                         $base.Note = 'Updated in Exchange; meeting update sent to all attendees. Review link label and invite content.'
+                    }
+                    if ($mtidUrls.Count -eq 1 -and $uniqueWebexUrls.Count -gt 1) {
+                        $otherUrlCount = $uniqueWebexUrls.Count - 1
+                        $base.Note += " Selected the unique MTID URL from $webexUrlSource; left $otherUrlCount other Webex URL(s) untouched."
                     }
                 }
                 catch {
@@ -552,7 +630,7 @@ else {
         }
         catch {
             $report.Add([pscustomobject]@{
-                MailboxSmtp = $mailbox; Subject = ''; StartUtc = ''; OriginalWebexUrl = ''; TeamsJoinUrl = ''
+                MailboxSmtp = $mailbox; Subject = ''; StartUtc = ''; OriginalWebexUrl = ''; WebexUrlSource = ''; TeamsJoinUrl = ''
                 Status = 'MailboxError'; Note = $_.Exception.Message
             })
         }
