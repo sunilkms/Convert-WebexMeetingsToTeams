@@ -26,6 +26,8 @@ Graph's `onlineMeeting:createOrGet` creates a standalone meeting that does not a
 
 The included script processes organizer-owned, non-cancelled single meetings and recurring series. It scans both the item body and Location field. It prefers scheduled Webex join links in the `j.php?MTID=...` form; URLs with the same MTID in that join-link group are treated as variants and replaced together. Other URLs, including `globalcallin.php` links, are left untouched. If there is no `j.php` join link with an MTID, the script uses a unique MTID or proceeds only when exactly one distinct Webex URL exists; multiple different MTIDs in the selected candidate group or multiple URLs without an MTID require manual review. The report's `WebexUrlSource` column identifies where selected links appeared, and `WebexUrlDiagnostics` lists each detected URL, its type, source, and parsed MTID—including duplicates—to help troubleshoot matching. Treat reports as sensitive because they contain meeting join URLs and MTIDs. For a recurring series, it binds to and updates the series master once, so the series uses one shared Teams URL. It skips attendee copies, items without a Webex URL, ambiguous multiple-link items, and events that already contain a Teams join URL. A modified occurrence (an exception) can have its own invite body; the script flags such series but does not rewrite exception bodies independently. Review those exceptions manually after applying, along with generated invite content and any Webex-specific instructions that remain.
 
+For an organization-wide sizing report, use the standalone [report script](scripts/Report-WebexMeetingsInventory.ps1). It reads mailbox-only CSV input and does not need Entra IDs or Graph access.
+
 The recurring series uses a standalone Graph meeting object. Microsoft documents a 60-day expiry after the meeting start/end that can be extended by updating or activating the meeting before expiry. Validate long recurring gaps over 60 days separately; they may require a refreshed link. [Graph onlineMeeting lifetime](https://learn.microsoft.com/en-us/graph/api/resources/onlinemeeting?view=graph-rest-1.0)
 
 ## Project files
@@ -35,6 +37,7 @@ The recurring series uses a standalone Graph meeting object. Microsoft documents
 | `README.md` | Project overview and quick-start guidance. |
 | `POC-Webex-to-Teams-Meeting-URL.md` | Detailed requirements, permission setup, Exchange scoping, runbook, validation steps, and rollback instructions. |
 | `scripts/Convert-WebexMeetingsToTeams.ps1` | Script with `Preview`, `Apply`, and `Rollback` modes and a Windows encrypted EWS credential cache. |
+| `scripts/Report-WebexMeetingsInventory.ps1` | Standalone, read-only organization-wide mailbox inventory with detailed and summary CSVs. |
 | `scripts/New-TargetsCsv.ps1` | Resolves pilot SMTP addresses to Entra object IDs and writes `targets.csv`. |
 | `pilot-mailboxes.csv` | Input template for pilot mailbox SMTP addresses and optional Entra UPNs. |
 | `targets.csv` | Output template consumed by the meeting conversion script. |
@@ -88,6 +91,42 @@ Preview reads meetings and writes a report. It does not call Graph or update Exc
   -WindowEndUtc "2026-11-20T00:00:00Z" `
   -ReportPath ".\preview.csv"
 ```
+
+### Organization-wide sizing report
+
+In Exchange Management Shell on Exchange SE, export the mailbox types to include in the inventory. This example includes user, shared, room, and equipment mailboxes; adjust the list to match the client's scope.
+
+```powershell
+Get-Mailbox -ResultSize Unlimited |
+  Where-Object {
+    $_.RecipientTypeDetails.ToString() -in @('UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox') -and
+    $_.PrimarySmtpAddress
+  } |
+  Select-Object `
+    @{Name='MailboxSmtp'; Expression={$_.PrimarySmtpAddress.ToString()}}, `
+    @{Name='MailboxType'; Expression={$_.RecipientTypeDetails.ToString()}} |
+  Export-Csv -LiteralPath ".\all-mailboxes-preview.csv" -NoTypeInformation -Encoding UTF8
+```
+
+Choose a finite future horizon agreed with the client. The example below scans the next 12 months; recurring series with an occurrence in that window are reported once and the script binds to the series master.
+
+```powershell
+$windowStart = [DateTimeOffset]::UtcNow
+$windowEnd = $windowStart.AddMonths(12)
+
+.\scripts\Report-WebexMeetingsInventory.ps1 `
+  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
+  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
+  -TargetsCsv ".\all-mailboxes-preview.csv" `
+  -WindowStartUtc $windowStart `
+  -WindowEndUtc $windowEnd `
+  -ReportPath ".\all-mailboxes-detail.csv" `
+  -SummaryPath ".\all-mailboxes-summary.csv"
+```
+
+The summary groups item counts by `MailboxType` and `Status`, and includes `MailboxType=All` totals. Count `WouldApply` and `WouldApplyRecurringSeries` as update candidates; review `Skipped*`, `MailboxError`, and recurring exception notes separately. The report script is read-only: it does not call Graph or modify Exchange. The report includes join URLs and MTIDs, so protect both CSV files. It splits date ranges when an EWS response exceeds 1,000 results; if even a one-hour slice exceeds that limit, that mailbox is reported as an error and the inventory is incomplete for it.
+
+This inventory can include shared and resource mailboxes for sizing. It does not establish that those mailbox types can host Teams meetings. Before using the conversion script's `Apply` mode, restrict the target list to validated Teams-enabled organizers and include their `EntraObjectId` values.
 
 ### Apply
 

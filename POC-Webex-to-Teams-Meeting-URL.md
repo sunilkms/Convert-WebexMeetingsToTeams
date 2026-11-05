@@ -255,6 +255,42 @@ Do not pass the EWS service account credential as a proxy credential. If Direct 
 
 Review each `WouldApply` and `WouldApplyRecurringSeries` row and the skip reasons. Check `OriginalWebexUrl`, `WebexUrlSource`, and `WebexUrlDiagnostics`. The diagnostics list every detected URL with its type, body/location source, and parsed MTID, including repeated matches; use this field to compare what EWS returned with the text in Outlook. Confirm the selected URL is the attendee join link (`j.php?MTID=...`). A different MTID on a `globalcallin.php` link is expected and that link remains unchanged. Different MTID values among join candidates require manual review. For recurring series, check `MeetingScope` and `HasModifiedOccurrences`. Preview never calls Graph.
 
+### Organization-wide sizing report (read-only)
+
+For an inventory across the Exchange SE mailbox types, first create a mailbox-only CSV in Exchange Management Shell. The standalone report script needs only `MailboxSmtp` and `MailboxType`; no Entra lookup or Graph connection is required.
+
+```powershell
+Get-Mailbox -ResultSize Unlimited |
+  Where-Object {
+    $_.RecipientTypeDetails.ToString() -in @('UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox') -and
+    $_.PrimarySmtpAddress
+  } |
+  Select-Object `
+    @{Name='MailboxSmtp'; Expression={$_.PrimarySmtpAddress.ToString()}}, `
+    @{Name='MailboxType'; Expression={$_.RecipientTypeDetails.ToString()}} |
+  Export-Csv -LiteralPath ".\all-mailboxes-preview.csv" -NoTypeInformation -Encoding UTF8
+```
+
+Choose an end date that matches the client's migration planning horizon. There is no finite query for literally every future occurrence. For example, to report the next 12 months:
+
+```powershell
+$windowStart = [DateTimeOffset]::UtcNow
+$windowEnd = $windowStart.AddMonths(12)
+
+.\scripts\Report-WebexMeetingsInventory.ps1 `
+  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
+  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
+  -TargetsCsv ".\all-mailboxes-preview.csv" `
+  -WindowStartUtc $windowStart `
+  -WindowEndUtc $windowEnd `
+  -ReportPath ".\all-mailboxes-detail.csv" `
+  -SummaryPath ".\all-mailboxes-summary.csv"
+```
+
+The detail report contains one row per calendar item/series outcome. The summary groups item counts by `MailboxType` and `Status`, and includes `MailboxType=All`. For the estimate, sum `WouldApply` and `WouldApplyRecurringSeries`; these are single meetings and recurring series found in the window, with each series counted once. Review skipped statuses and `MailboxError` separately. A successful mailbox with no items gets `NoCalendarItemsInWindow`. The script splits date ranges if EWS says a window has more than 1,000 results; if a one-hour slice still exceeds that limit, it records a mailbox error rather than claiming a complete count.
+
+If a recurring series has an occurrence in the selected window, the script binds to its master and a later Apply updates that series beyond the selected window as well. Modified occurrences are flagged for manual review. Shared and resource mailbox types can be included for inventory, but do not assume they are valid Teams meeting organizers; restrict Apply to organizers confirmed to have Teams and the required application access policy. Ensure the EWS impersonation scope includes the mailbox set being inventoried.
+
 ### Step 8 — Apply to the smallest possible sample
 
 1. Start with one test organizer and one single-instance meeting with only a test attendee.
@@ -310,6 +346,7 @@ Restore the attributes from the exported file by setting each mailbox's prior `C
 ## 6. Script files and execution notes
 
 - Script: [scripts/Convert-WebexMeetingsToTeams.ps1](scripts/Convert-WebexMeetingsToTeams.ps1)
+- Read-only organization-wide inventory: [scripts/Report-WebexMeetingsInventory.ps1](scripts/Report-WebexMeetingsInventory.ps1)
 - If Preview reports `MailboxError` with `'TimeZone' is a ReadOnly property.`, use the current script version: EWS time zone is supplied to the `ExchangeService(ExchangeVersion, TimeZoneInfo)` constructor. The `TimeZone` property is read-only. [ExchangeService constructors and properties](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.exchangeservice?view=exchange-ews-api)
 - If Preview reports `Cannot find an overload for "Bind"` or `Cannot find an overload for "Load"`, use the current script version. `PropertySet` implements `IEnumerable`; the helper preserves it as one object so PowerShell does not expand its contents into separate arguments. [Appointment.Bind overloads](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.appointment.bind?view=exchange-ews-api), [EWS PropertySet source](https://github.com/OfficeDev/ews-managed-api/blob/master/Core/PropertySet.cs)
 - If an older script rejects `-WindowStartUtc` or `-WindowEndUtc` even though the values end in `Z`, use the current script version, which accepts `DateTimeOffset` parameters. Avoid removing the `Z` and applying `[DateTime]::SpecifyKind` unless the clock values are already UTC; `SpecifyKind` labels a value and does not convert a local time to UTC.

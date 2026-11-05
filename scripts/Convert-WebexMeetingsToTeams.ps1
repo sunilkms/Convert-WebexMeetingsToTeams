@@ -701,7 +701,8 @@ else {
         }
         catch {
             $report.Add([pscustomobject]@{
-                MailboxSmtp = $mailbox; Subject = ''; StartUtc = ''; OriginalWebexUrl = ''; WebexUrlSource = ''; WebexUrlDiagnostics = ''; TeamsJoinUrl = ''
+                MailboxSmtp = $mailbox; Subject = ''; StartUtc = ''; OriginalWebexUrl = ''
+                WebexUrlSource = ''; WebexUrlDiagnostics = ''; TeamsJoinUrl = ''
                 Status = 'MailboxError'; Note = $_.Exception.Message
             })
         }
