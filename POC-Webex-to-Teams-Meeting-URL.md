@@ -43,11 +43,11 @@ Use UTC timestamps for the scan window. Avoid meetings already in progress or cl
 - A dedicated, enabled on-premises AD service account for EWS. Do not use an Exchange admin account.
 - A test mailbox allowlist and a matching Entra object ID for each organizer. Each organizer must be represented in Entra ID, enabled for Teams, and licensed/configured to create Teams meetings.
 - EWS Managed API 2.2 assembly available from an approved source. The Microsoft EWS Managed API repository is archived; it is used here only as a small POC client wrapper. [Repository](https://github.com/OfficeDev/ews-managed-api)
-- PowerShell 5.1 on Windows, the `Microsoft.Graph.Authentication` PowerShell module, and an app certificate with its private key installed in the certificate store accessible to the Windows account that runs the script.
+- PowerShell 5.1 on Windows, the `Microsoft.Graph.Authentication` PowerShell module, and either an app certificate available to the Windows account that runs the script or a client secret for the Graph app.
 
 ### App registration and permissions
 
-Use a dedicated single-tenant Graph app registration and certificate for the POC. Add only:
+Use a dedicated single-tenant Graph app registration. Choose certificate or client-secret authentication for the app; both use the same Graph permissions below. Certificates are the recommended credential for production, while a client secret can be useful for a controlled POC. Add only:
 
 | API | Permission | Type | Purpose |
 | --- | --- | --- | --- |
@@ -59,10 +59,10 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 
 ### Minimum operational roles
 
-- Entra admin for the one-time Graph app permission/admin consent and certificate configuration.
+- Entra admin for the one-time Graph app permission/admin consent and credential configuration.
 - Teams admin (or an admin role permitted to manage Teams application access policies) for the policy and per-user grants.
 - Exchange organization admin for the one-time scoped impersonation role assignment and EWS configuration checks.
-- Script operator: read the target CSV, read the certificate private key, and authenticate as the EWS service account. No permanent Exchange administrator role is needed for the operator.
+- Script operator: read the target CSV, access the selected Graph credential (certificate private key or client secret), and authenticate as the EWS service account. No permanent Exchange administrator role is needed for the operator.
 
 ## 4. One-time setup
 
@@ -76,7 +76,9 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 ### Step 2 — Create and authorize the Graph app
 
 1. Register a single-tenant application, for example `WebexTeamsMeetingUrlPOC`.
-2. Sign in to the POC runner as the same Windows account that will run the script. Create a self-signed certificate in that account's `CurrentUser\My` store. This is suitable for the POC; use your organization's approved PKI certificate process for production.
+2. Configure one or both Graph credential methods on the same app registration; the script's `-GraphAuthMethod` parameter selects the method for each Apply run:
+
+   **Certificate (default script option):** Sign in to the POC runner as the same Windows account that will run the script. Create a self-signed certificate in that account's `CurrentUser\My` store. This is suitable for the POC; use your organization's approved PKI certificate process for production.
 
    ```powershell
    $cert = New-SelfSignedCertificate `
@@ -97,10 +99,14 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
    ```
 
    This keeps the private key in the Windows certificate store and exports only the public `.cer` file. Keep the thumbprint for the script. If a different Windows account or runner will execute the script, create/install a corresponding certificate for that run-as identity and upload its public certificate; the account must be able to read the private key.
-3. In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Certificates** > **Upload certificate**. Select `WebexTeamsMeetingUrlPOC.cer` and add it. Upload only the `.cer`; do not upload or distribute a private key.
-4. Add Microsoft Graph **Application** permission `OnlineMeetings.ReadWrite.All`; grant admin consent.
-5. Record the tenant ID, app/client ID, and certificate thumbprint. Do not put private-key material in the script or CSV.
-6. Do not add Graph Calendar or Mail permissions.
+
+   In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Certificates** > **Upload certificate**. Select `WebexTeamsMeetingUrlPOC.cer` and add it. Upload only the `.cer`; do not upload or distribute a private key.
+
+   **Client secret (alternative):** In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Client secrets** > **New client secret**. Choose an expiry that follows your organization's policy, create the secret, and copy its **Value** immediately into your approved password manager. The first Apply in `ClientSecret` mode prompts for it with hidden input, then saves it encrypted with Windows DPAPI after Graph authentication succeeds. Later runs reuse `%LOCALAPPDATA%\WebexTeamsPOC\graph-client-secret.xml` without prompting, under the same Windows account on the same computer. Do not put the secret in the script, command line, CSV, or logs. If the secret rotates, delete this cache so the script prompts for the new value. Client secrets expire and are less secure than certificates; use a certificate or managed/federated credential for production.
+
+3. Add Microsoft Graph **Application** permission `OnlineMeetings.ReadWrite.All`; grant admin consent.
+4. Record the tenant ID and app/client ID, plus the certificate thumbprint if using certificate authentication. Do not put private-key or client-secret material in the script or CSV.
+5. Do not add Graph Calendar or Mail permissions.
 
 On the runner, install the approved PowerShell modules if they are not already present:
 
@@ -109,7 +115,7 @@ Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
 Install-Module MicrosoftTeams -Scope CurrentUser
 ```
 
-Confirm that the certificate and private key are available to the current Windows account, then test app-only Graph authentication:
+For certificate authentication, confirm that the certificate and private key are available to the current Windows account, then test app-only Graph authentication:
 
 ```powershell
 $thumbprint = "<CERTIFICATE-THUMBPRINT>"
@@ -127,7 +133,7 @@ Get-MgContext | Format-List AuthType, TenantId, ClientId, CertificateThumbprint
 Disconnect-MgGraph
 ```
 
-Confirm `HasPrivateKey` is `True` and `AuthType` is `AppOnly`. The conversion script uses the same certificate thumbprint with `Connect-MgGraph`. Microsoft Graph PowerShell supports certificate-based app-only authentication from the Windows certificate store. [Graph PowerShell app-only authentication](https://learn.microsoft.com/en-us/powershell/microsoftgraph/app-only?view=graph-powershell-1.0), [Connect-MgGraph certificate parameters](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.authentication/connect-mggraph?view=graph-powershell-1.0)
+Confirm `HasPrivateKey` is `True` and `AuthType` is `AppOnly`. For client-secret authentication, the conversion script handles the hidden first-use prompt and caches the secret only after the Graph connection succeeds. Preview and Rollback do not prompt for Graph credentials. [Graph PowerShell app-only authentication](https://learn.microsoft.com/en-us/powershell/microsoftgraph/app-only?view=graph-powershell-1.0), [Connect-MgGraph authentication options](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.authentication/connect-mggraph?view=graph-powershell-1.0)
 
 ### Step 3 — Limit Graph meeting API access to the pilot organizers
 
@@ -234,6 +240,14 @@ Remove-Item -LiteralPath "$env:LOCALAPPDATA\WebexTeamsPOC\ews-credential.xml"
 
 To use a different cache location, pass `-EwsCredentialPath "<path>"`. The cache remains tied to the same Windows account and computer. Microsoft documents that `Export-Clixml` encrypts credentials with Windows DPAPI and that the exported credential cannot be used by a different user or computer. [Export-Clixml credential encryption](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/export-clixml?view=powershell-5.1)
 
+In `ClientSecret` mode, the Graph client secret is separately cached at `%LOCALAPPDATA%\WebexTeamsPOC\graph-client-secret.xml` after successful authentication. It uses the same Windows DPAPI user/computer scope. To refresh a rotated secret, remove it:
+
+```powershell
+Remove-Item -LiteralPath "$env:LOCALAPPDATA\WebexTeamsPOC\graph-client-secret.xml"
+```
+
+To use another location, pass `-GraphClientSecretPath "<path>"`. Do not copy the encrypted cache to a different Windows account or computer; run once there to create a local cache.
+
 For automatic cache use, omit `-EwsCredential` and any separate `$ewsCredential = Get-Credential` line from the command. Supplying `-EwsCredential` explicitly overrides the cache.
 
 ### Troubleshooting EWS proxy errors
@@ -306,10 +320,13 @@ If a recurring series has an occurrence in the selected window, the script binds
      -WindowEndUtc "2026-11-20T00:00:00Z" `
      -GraphTenantId "<TENANT-ID>" `
      -GraphAppId "<GRAPH-APP-CLIENT-ID>" `
+     -GraphAuthMethod Certificate `
      -GraphCertificateThumbprint "<CERTIFICATE-THUMBPRINT>" `
      -BackupPath ".\teams-poc-backup-20261105-120000.jsonl" `
      -ReportPath ".\apply.csv"
    ```
+
+   To use a client secret instead, choose `-GraphAuthMethod ClientSecret` and omit `-GraphCertificateThumbprint`. On first Apply, the script prompts once with hidden input and caches the secret after successful Graph authentication; later runs reuse the DPAPI-encrypted cache. Preview and Rollback do not require Graph authentication.
 
 3. Confirm the script report says `Applied` and capture the Teams URL from the report.
 4. Confirm the organizer's Exchange item has the Teams link in the body and/or Location where the selected Webex URL appeared. Other Webex URLs reported as left untouched will still be present.

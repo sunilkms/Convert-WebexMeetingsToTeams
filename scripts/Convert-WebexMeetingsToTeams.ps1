@@ -22,7 +22,10 @@ param(
 
     [string] $GraphTenantId,
     [string] $GraphAppId,
+    [ValidateSet('Certificate', 'ClientSecret')]
+    [string] $GraphAuthMethod = 'Certificate',
     [string] $GraphCertificateThumbprint,
+    [string] $GraphClientSecretPath = (Join-Path $env:LOCALAPPDATA 'WebexTeamsPOC\graph-client-secret.xml'),
 
     [string] $BackupPath = ('.\teams-poc-backup-{0}.jsonl' -f (Get-Date -Format 'yyyyMMdd-HHmmss')),
     [string] $ReportPath = ('.\teams-poc-report-{0}.csv' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -133,6 +136,73 @@ function Resolve-EwsCredential {
 
     Write-Host "Encrypted EWS credential saved to: $credentialFullPath"
     return $newCredential
+}
+
+function Resolve-GraphClientSecretCredential {
+    param(
+        [Parameter(Mandatory = $true)][string] $AppId,
+        [Parameter(Mandatory = $true)][string] $CredentialPath
+    )
+
+    if ($env:OS -ne 'Windows_NT') {
+        throw 'The encrypted Graph client secret cache requires Windows DPAPI. Run this script on Windows PowerShell on Windows.'
+    }
+    if ([string]::IsNullOrWhiteSpace($CredentialPath)) {
+        throw 'GraphClientSecretPath cannot be empty.'
+    }
+
+    $credentialFullPath = [System.IO.Path]::GetFullPath($CredentialPath)
+    if (Test-Path -LiteralPath $credentialFullPath -PathType Leaf) {
+        try {
+            $savedCredential = Import-Clixml -LiteralPath $credentialFullPath -ErrorAction Stop
+        }
+        catch {
+            throw "Could not decrypt the saved Graph client secret at '$credentialFullPath'. Run as the same Windows user on the same computer that created it, or remove the file and rerun to save a replacement. Details: $($_.Exception.Message)"
+        }
+        if ($savedCredential -isnot [System.Management.Automation.PSCredential]) {
+            throw "The saved file '$credentialFullPath' does not contain a PowerShell credential. Remove it and rerun to create a new encrypted Graph client secret file."
+        }
+        if ($savedCredential.UserName -ne $AppId) {
+            throw "The saved Graph credential at '$credentialFullPath' is for a different app ID. Remove that file or choose another GraphClientSecretPath."
+        }
+        return [pscustomobject]@{
+            Credential = $savedCredential
+            NeedsSave  = $false
+            Path       = $credentialFullPath
+        }
+    }
+
+    $secureSecret = Read-Host -Prompt 'Enter Graph app client secret. It will be saved encrypted after successful Graph authentication.' -AsSecureString
+    if ($null -eq $secureSecret -or $secureSecret.Length -eq 0) {
+        throw 'A Graph client secret is required when GraphAuthMethod is ClientSecret.'
+    }
+    $newCredential = [System.Management.Automation.PSCredential]::new($AppId, $secureSecret)
+
+    return [pscustomobject]@{
+        Credential = $newCredential
+        NeedsSave  = $true
+        Path       = $credentialFullPath
+    }
+}
+
+function Save-GraphClientSecretCredential {
+    param(
+        [Parameter(Mandatory = $true)][System.Management.Automation.PSCredential] $Credential,
+        [Parameter(Mandatory = $true)][string] $CredentialPath
+    )
+
+    $credentialDirectory = Split-Path -Path $CredentialPath -Parent
+    if ($credentialDirectory -and -not (Test-Path -LiteralPath $credentialDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $credentialDirectory -Force | Out-Null
+    }
+    try {
+        $Credential | Export-Clixml -Path $CredentialPath -Force -ErrorAction Stop
+    }
+    catch {
+        throw "Could not save the encrypted Graph client secret to '$CredentialPath'. Details: $($_.Exception.Message)"
+    }
+
+    Write-Host "Encrypted Graph client secret saved to: $CredentialPath"
 }
 
 function New-TeamsExternalId {
@@ -342,15 +412,36 @@ else {
     }
 
     if ($Mode -eq 'Apply') {
-        if (-not $GraphTenantId -or -not $GraphAppId -or -not $GraphCertificateThumbprint) {
-            throw 'Apply requires GraphTenantId, GraphAppId, and GraphCertificateThumbprint.'
+        if (-not $GraphTenantId -or -not $GraphAppId) {
+            throw 'Apply requires GraphTenantId and GraphAppId.'
         }
         if (Test-Path -LiteralPath $BackupPath) {
             throw "Backup path already exists. Choose a new path so the rollback source is unambiguous: $BackupPath"
         }
         Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        Connect-MgGraph -TenantId $GraphTenantId -ClientId $GraphAppId `
-            -CertificateThumbprint $GraphCertificateThumbprint -ContextScope Process -NoWelcome
+        if ($GraphAuthMethod -eq 'Certificate') {
+            if (-not $GraphCertificateThumbprint) {
+                throw 'Certificate authentication requires GraphCertificateThumbprint.'
+            }
+            Connect-MgGraph -TenantId $GraphTenantId -ClientId $GraphAppId `
+                -CertificateThumbprint $GraphCertificateThumbprint -ContextScope Process -NoWelcome
+        }
+        else {
+            $resolvedGraphCredential = Resolve-GraphClientSecretCredential `
+                -AppId $GraphAppId -CredentialPath $GraphClientSecretPath
+            try {
+                Connect-MgGraph -TenantId $GraphTenantId -ClientSecretCredential $resolvedGraphCredential.Credential `
+                    -ContextScope Process -NoWelcome
+            }
+            catch {
+                throw "Could not connect to Graph with the client secret. If the app secret was rotated, remove the encrypted cache at '$($resolvedGraphCredential.Path)' and rerun. Details: $($_.Exception.Message)"
+            }
+            if ($resolvedGraphCredential.NeedsSave) {
+                Save-GraphClientSecretCredential -Credential $resolvedGraphCredential.Credential `
+                    -CredentialPath $resolvedGraphCredential.Path
+            }
+            $resolvedGraphCredential = $null
+        }
     }
 
     $findProps = [Microsoft.Exchange.WebServices.Data.PropertySet]::new(
