@@ -1,3 +1,5 @@
+# LEGACY COMBINED WORKFLOW: new batches should use fetch_webex_meeting.ps1,
+# create_teams_meeting_link.ps1, and update_webex_meeting.ps1 instead.
 [CmdletBinding()]
 param(
     [ValidateSet('Preview', 'Prepare', 'Apply', 'Rollback')]

@@ -2,16 +2,17 @@
 
 ## 1. POC outcome and design
 
-For a batch, first create `targets.csv` and use EWS Preview/reporting to identify candidate meetings. The script's `Prepare` mode then uses Microsoft Graph `onlineMeeting:createOrGet` to create or retrieve Teams join URLs without changing Exchange. After reviewing the prepared report, `Apply` rechecks the same batch, reuses those links, replaces the selected Webex URL in each on-premises event, and sends updated invitations. The API is keyed to the Teams user, while the calendar event stays on-premises; this fit is an inference from the API request model, so prove it with one pilot organizer before processing more meetings. [Graph `createOrGet`](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-createorget?view=graph-rest-1.0)
+The workflow uses three scripts and CSV handoffs. First create `targets.csv`, then `fetch_webex_meeting.ps1` exports each targeted user's calendar to `output/<email>-webex-export.csv`. Next, `create_teams_meeting_link.ps1` uses Microsoft Graph `onlineMeeting:createOrGet` to create or retrieve links and writes `prepared/<email>.csv`. After reviewing that file and approving individual rows, `update_webex_meeting.ps1` replaces the selected Webex URL in the corresponding on-premises event and sends updated invitations. The API is keyed to the Teams user, while the calendar event stays on-premises; this fit is an inference from the API request model, so prove it with one pilot organizer before processing more meetings. [Graph `createOrGet`](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-createorget?view=graph-rest-1.0)
 
 ```mermaid
 flowchart LR
-    A[Allowlisted organizer and date window] --> B[PowerShell POC runner]
-    B -->|Preview: EWS read calendar| C[On-prem Exchange SE]
-    B -->|Prepare: Graph createOrGet| D[Teams meeting service]
-    D -->|joinWebUrl and review report| B
-    B -->|Apply: EWS replace URL and send update| C
-    C -->|Updated invitation| E[Meeting attendees]
+    A[targets.csv and UTC window] --> B[1. fetch_webex_meeting.ps1]
+    B -->|per-user export CSVs| C[output/]
+    C --> D[2. create_teams_meeting_link.ps1]
+    D -->|Graph createOrGet and per-user prepared CSVs| E[prepared/]
+    E -->|review and approve rows| F[3. update_webex_meeting.ps1]
+    F -->|EWS replace URL and send update| G[On-prem Exchange SE]
+    G -->|Updated invitation| H[Meeting attendees]
 ```
 
 This is a link replacement workflow. Microsoft's Graph `onlineMeeting` API explicitly says the created meeting does not appear on the user's calendar. The Teams meeting object and the on-premises Exchange event therefore remain separate objects: the join link works from the updated invite, but this does not make the Exchange item a fully native Teams calendar event or provide Teams-calendar synchronization/chat association. This is an inference from the API's separate `onlineMeeting` resource and its calendar limitation. [Graph `createOrGet`](https://learn.microsoft.com/en-us/graph/api/onlinemeeting-createorget?view=graph-rest-1.0), [choosing an online-meeting API](https://learn.microsoft.com/en-us/graph/choose-online-meeting-api)
@@ -28,7 +29,7 @@ The script creates one standalone Graph meeting object and reuses its join URL f
 
 This creates a new Teams meeting and substitutes its join URL. It does not migrate Webex meeting IDs, host keys, dial-in details, registration, recordings, attendance data, or Webex policies. Treat the attendee update as a new Teams join instruction and validate the Teams meeting policy separately.
 
-The script's default mode is `Preview`: it reads EWS items and reports candidates but does not create Graph meetings or change invitations. `Apply` creates/reuses the Teams meeting and updates the invite body and, when applicable, Location. `Rollback` restores the backed-up body and Location for items changed by this script and sends another update to attendees; it skips an item if either field differs from the saved post-apply value. Reports include detected Webex join URLs and parsed MTIDs, while backups contain meeting body and Location content; store both in an access-controlled location and delete them according to your retention rules after the POC.
+Stage 1 is read-only and reports candidate meetings per user. Stage 2 creates/retrieves Teams links but does not change Exchange. Stage 3 updates only prepared rows whose `Status` is `ReadyForUpdate` and whose `ApprovedForUpdate` value is `Yes`. It checks that the Exchange change key and selected Webex URL still match the fetched event. `update_webex_meeting.ps1 -Mode Rollback` restores the backed-up body and Location for items changed by stage 3 and sends another update to attendees; it skips an item if either field differs from the saved post-update value. Reports include detected Webex join URLs and parsed MTIDs, while backups contain meeting body and Location content; store both in an access-controlled location and delete them according to your retention rules after the POC.
 
 Use UTC timestamps for the scan window. Avoid meetings already in progress or close to their start. Have the test organizer run a real meeting with internal and external attendees and verify the join/lobby policy before broadening the pilot.
 
@@ -76,7 +77,7 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 ### Step 2 — Create and authorize the Graph app
 
 1. Register a single-tenant application, for example `WebexTeamsMeetingUrlPOC`.
-2. Configure one or both Graph credential methods on the same app registration; the script's `-GraphAuthMethod` parameter selects the method for each Apply run:
+2. Configure one or both Graph credential methods on the same app registration; stage 2's `-GraphAuthMethod` parameter selects the authentication method:
 
    **Certificate (default script option):** Sign in to the POC runner as the same Windows account that will run the script. Create a self-signed certificate in that account's `CurrentUser\My` store. This is suitable for the POC; use your organization's approved PKI certificate process for production.
 
@@ -102,7 +103,7 @@ For EWS, the service account needs the `ApplicationImpersonation` role, scoped t
 
    In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Certificates** > **Upload certificate**. Select `WebexTeamsMeetingUrlPOC.cer` and add it. Upload only the `.cer`; do not upload or distribute a private key.
 
-   **Client secret (alternative):** In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Client secrets** > **New client secret**. Choose an expiry that follows your organization's policy, create the secret, and copy its **Value** immediately into your approved password manager. The first Graph-authenticated run in `ClientSecret` mode (normally the Prepare stage) prompts for it with hidden input, then saves it encrypted with Windows DPAPI after Graph authentication succeeds. Later runs reuse `%LOCALAPPDATA%\WebexTeamsPOC\graph-client-secret.xml` without prompting, under the same Windows account on the same computer. Do not put the secret in the script, command line, CSV, or logs. If the secret rotates, delete this cache so the script prompts for the new value. Client secrets expire and are less secure than certificates; use a certificate or managed/federated credential for production.
+   **Client secret (alternative):** In the Entra admin center, open **App registrations** > your POC app > **Certificates & secrets** > **Client secrets** > **New client secret**. Choose an expiry that follows your organization's policy, create the secret, and copy its **Value** immediately into your approved password manager. The first Graph-authenticated stage 2 run in `ClientSecret` mode prompts for it with hidden input, then saves it encrypted with Windows DPAPI after Graph authentication succeeds. Later runs reuse `%LOCALAPPDATA%\WebexTeamsPOC\graph-client-secret.xml` without prompting, under the same Windows account on the same computer. Do not put the secret in the script, command line, CSV, or logs. If the secret rotates, delete this cache so the script prompts for the new value. Client secrets expire and are less secure than certificates; use a certificate or managed/federated credential for production.
 
 3. Add Microsoft Graph **Application** permission `OnlineMeetings.ReadWrite.All`; grant admin consent.
 4. Record the tenant ID and app/client ID, plus the certificate thumbprint if using certificate authentication. Do not put private-key or client-secret material in the script or CSV.
@@ -133,7 +134,7 @@ Get-MgContext | Format-List AuthType, TenantId, ClientId, CertificateThumbprint
 Disconnect-MgGraph
 ```
 
-Confirm `HasPrivateKey` is `True` and `AuthType` is `AppOnly`. For client-secret authentication, the conversion script handles the hidden first-use prompt and caches the secret only after the Graph connection succeeds. Preview and Rollback do not prompt for Graph credentials. [Graph PowerShell app-only authentication](https://learn.microsoft.com/en-us/powershell/microsoftgraph/app-only?view=graph-powershell-1.0), [Connect-MgGraph authentication options](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.authentication/connect-mggraph?view=graph-powershell-1.0)
+Confirm `HasPrivateKey` is `True` and `AuthType` is `AppOnly`. For client-secret authentication, the stage 2 script handles the hidden first-use prompt and caches the secret only after the Graph connection succeeds. Stage 1 and stage 3 do not require Graph authentication. [Graph PowerShell app-only authentication](https://learn.microsoft.com/en-us/powershell/microsoftgraph/app-only?view=graph-powershell-1.0), [Connect-MgGraph authentication options](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.authentication/connect-mggraph?view=graph-powershell-1.0)
 
 ### Step 3 — Limit Graph meeting API access to the pilot organizers
 
@@ -203,7 +204,7 @@ If this role assignment or scope already exists, inspect and validate it rather 
    ```
 
    Keep server authentication consistent with your security baseline; do not enable Basic authentication just for this POC.
-3. Sign in to the runner using the POC operator account, then run script `Preview` for one mailbox and a narrow date window.
+3. Sign in to the runner using the POC operator account, then run `fetch_webex_meeting.ps1` for one mailbox and a narrow date window.
 4. If EWS rejects the service account, confirm the endpoint's Windows-auth settings, the impersonation assignment, the recipient scope, firewall/reverse-proxy rules, and the mailbox's EWS access setting. Do not broaden the role assignment to the whole organization as a troubleshooting shortcut.
 5. If Windows authentication is unavailable, stop here and validate the dedicated HMA app/certificate path for this Exchange SE organization. The HMA app-only pattern uses the Office 365 Exchange Online `full_access_as_app` application permission and can be further scoped with Exchange impersonation; the details are not interchangeable with Graph permissions. [HMA app pattern](https://learn.microsoft.com/en-us/power-platform/admin/connect-exchange-server-onprem-hma)
 
@@ -228,188 +229,105 @@ The helper signs in interactively with delegated, read-only `User.ReadBasic.All`
 
 ## 5. Run the POC
 
-### Step 7 — Identify and preview the batch (stage 1)
+### Step 7 — Fetch Webex meetings (stage 1)
 
-Open Windows PowerShell 5.1 on the runner. Use ISO 8601 UTC start/end values ending in `Z`. The script accepts these as `DateTimeOffset` values and converts them to UTC for EWS. On the first run, it prompts for the EWS service credential and saves it as a DPAPI-encrypted CLIXML file under `%LOCALAPPDATA%\WebexTeamsPOC\ews-credential.xml`; subsequent runs reuse that file without prompting.
-
-Generate the meeting inventory report for the users in `targets.csv`. The extra `EntraObjectId` column is ignored by the read-only report script. Choose one date window and reuse it in Preview, Prepare, and Apply:
+The three conversion scripts pass data through per-user CSV files. Generate `targets.csv` with the reviewed `MailboxSmtp,EntraObjectId` rows. For the first end-to-end test, keep one organizer in this file; after it succeeds, add the remaining approved organizers. Choose one finite UTC window for the batch and use the same window when rerunning stage 1. A recurring series that has an occurrence in the selected window is exported once and the update stage changes its master.
 
 ```powershell
 $batchStart = [DateTimeOffset]::UtcNow
 $batchEnd = $batchStart.AddDays(30)
+$ewsUrl = "https://mail.contoso.com/EWS/Exchange.asmx"
+$ewsDll = "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll"
 
-.\scripts\Report-WebexMeetingsInventory.ps1 `
-  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
-  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
+.\scripts\fetch_webex_meeting.ps1 `
+  -EwsUrl $ewsUrl `
+  -EwsManagedApiDll $ewsDll `
   -TargetsCsv ".\targets.csv" `
   -WindowStartUtc $batchStart `
   -WindowEndUtc $batchEnd `
-  -ReportPath ".\target-users-detail.csv" `
-  -SummaryPath ".\target-users-summary.csv"
+  -OutputDirectory ".\output"
 ```
 
-For the first single-organizer pilot, create `targets-one.csv` from the reviewed `targets.csv` and use it consistently in all three conversion stages. After the pilot succeeds, repeat the stages with the full `targets.csv` batch.
-
-The cached credential can be decrypted only by the same Windows user on the same computer that created it. Run the script consistently under that account. If the service account password changes or you need to replace the cached credential, remove the file and run the script again to be prompted:
+The first EWS run prompts for the service credential and saves it encrypted at `%LOCALAPPDATA%\WebexTeamsPOC\ews-credential.xml`. The cache is decryptable only by the same Windows user on the same computer. To replace a rotated credential, remove the cache and rerun:
 
 ```powershell
 Remove-Item -LiteralPath "$env:LOCALAPPDATA\WebexTeamsPOC\ews-credential.xml"
 ```
 
-To use a different cache location, pass `-EwsCredentialPath "<path>"`. The cache remains tied to the same Windows account and computer. Microsoft documents that `Export-Clixml` encrypts credentials with Windows DPAPI and that the exported credential cannot be used by a different user or computer. [Export-Clixml credential encryption](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/export-clixml?view=powershell-5.1)
+The default EWS proxy mode is `Direct`, which avoids the HTTP 407 seen when an internal EWS endpoint was sent through a system proxy. If the approved route requires a proxy, pass `-EwsProxyMode System` or `-EwsProxyMode SystemDefaultCredentials`.
 
-In `ClientSecret` mode, the Graph client secret is separately cached at `%LOCALAPPDATA%\WebexTeamsPOC\graph-client-secret.xml` after successful authentication. It uses the same Windows DPAPI user/computer scope. To refresh a rotated secret, remove it:
+Stage 1 writes one file per target, for example `output\pilot.organizer@contoso.com-webex-export.csv`. Review the `Status`, subject, time, `MeetingScope`, `HasModifiedOccurrences`, `OriginalWebexUrl`, and `WebexUrlDiagnostics` fields. The diagnostics show each detected URL, source, and MTID, including duplicates. The script prefers the scheduled attendee join URL (`j.php?MTID=...`); a different MTID on a call-in (`globalcallin.php`) link can be expected. Only `ReadyForTeamsLink` rows move to stage 2. Resolve `SkippedMultipleMtidWebex` or other URL review statuses before proceeding. Protect the CSVs because they contain join URLs and meeting identifiers.
+
+For an organization-wide estimate across user, shared, room, and equipment mailboxes, use the separate read-only [inventory report script](scripts/Report-WebexMeetingsInventory.ps1). Supply a mailbox list and a finite planning horizon, such as the next 12 months. It reports recurring series once when any occurrence lands in the window; it does not imply that meetings beyond that horizon were counted. The inventory is for sizing and is not the conversion input unless its rows are resolved to Teams-enabled organizers and Entra object IDs.
+
+### Step 8 — Create Teams links and review the prepared CSVs (stage 2)
+
+Run stage 2 on the `output` directory. It reads rows marked `ReadyForTeamsLink`, calls Graph `onlineMeeting:createOrGet`, and writes a matching per-user file such as `prepared\pilot.organizer@contoso.com.csv`. It does not read or modify Exchange. Rows that were skipped or need manual review are retained in the prepared CSV with their status.
+
+Certificate authentication:
+
+```powershell
+.\scripts\create_teams_meeting_link.ps1 `
+  -InputDirectory ".\output" `
+  -OutputDirectory ".\prepared" `
+  -GraphTenantId "<TENANT-ID>" `
+  -GraphAppId "<GRAPH-APP-CLIENT-ID>" `
+  -GraphAuthMethod Certificate `
+  -GraphCertificateThumbprint "<CERTIFICATE-THUMBPRINT>"
+```
+
+For client-secret authentication, use `-GraphAuthMethod ClientSecret` and omit the certificate thumbprint. On first use, the script securely prompts for the secret and saves it encrypted at `%LOCALAPPDATA%\WebexTeamsPOC\graph-client-secret.xml` after Graph authentication succeeds. The cache is tied to the same Windows user and computer. Remove it after rotating the secret:
 
 ```powershell
 Remove-Item -LiteralPath "$env:LOCALAPPDATA\WebexTeamsPOC\graph-client-secret.xml"
 ```
 
-To use another location, pass `-GraphClientSecretPath "<path>"`. Do not copy the encrypted cache to a different Windows account or computer; run once there to create a local cache.
+Review each prepared CSV. Confirm the selected Webex join URLs and diagnostics, meeting subject/time/scope, and `TeamsJoinUrl`. Set `ApprovedForUpdate` to `Yes` only for the rows to apply; leave other rows as `No`. Save the file. This is the row-by-row approval gate for stage 3. Do not change the EWS item ID/change key or URL fields. The Graph meeting objects are standalone; unused links may remain if you do not apply them, and Exchange rollback does not delete them.
 
-For automatic cache use, omit `-EwsCredential` and any separate `$ewsCredential = Get-Credential` line from the command. Supplying `-EwsCredential` explicitly overrides the cache.
+### Step 9 — Update approved meetings (stage 3)
 
-### Troubleshooting EWS proxy errors
-
-If the report contains `407 Proxy Authentication Required`, the runner's HTTP request is being challenged by a proxy before it reaches EWS. This is separate from the EWS service credential and Exchange impersonation. Check the intended route for the EWS host with your network team. The script defaults to `-EwsProxyMode Direct`, which is appropriate for this POC's internal EWS endpoint and avoids changing the machine-wide proxy setting. If EWS must use the system proxy, select `-EwsProxyMode System`; if the proxy accepts Windows integrated authentication, select `-EwsProxyMode SystemDefaultCredentials`, which uses the Windows account running PowerShell for proxy authentication.
-
-Do not pass the EWS service account credential as a proxy credential. If Direct is blocked and the proxy does not accept the logged-on Windows credentials, the proxy administrator must provide the approved route or authentication method. The script exposes these proxy modes through the EWS Managed API `WebProxy` property and .NET proxy credentials. [EWS ExchangeService WebProxy](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.exchangeservice?view=exchange-ews-api), [WebProxy credentials for HTTP 407](https://learn.microsoft.com/en-us/dotnet/api/system.net.webproxy.credentials)
+Start with one test organizer and one single-instance meeting with a test attendee. Set `-FilePattern` to only that user's prepared CSV. Use `*.csv` when you are ready to process every reviewed per-user file.
 
 ```powershell
-.\scripts\Convert-WebexMeetingsToTeams.ps1 `
-  -Mode Preview `
-  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
-  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -TargetsCsv ".\targets-one.csv" `
-  -WindowStartUtc $batchStart `
-  -WindowEndUtc $batchEnd `
-  -ReportPath ".\preview.csv"
+.\scripts\update_webex_meeting.ps1 `
+  -EwsUrl $ewsUrl `
+  -EwsManagedApiDll $ewsDll `
+  -InputDirectory ".\prepared" `
+  -FilePattern "pilot.organizer@contoso.com.csv" `
+  -OutputDirectory ".\applied" `
+  -BackupPath ".\backups\pilot-update.jsonl"
 ```
 
-Review each `WouldApply` and `WouldApplyRecurringSeries` row and the skip reasons. Check `OriginalWebexUrl`, `WebexUrlSource`, and `WebexUrlDiagnostics`. The diagnostics list every detected URL with its type, body/location source, and parsed MTID, including repeated matches; use this field to compare what EWS returned with the text in Outlook. Confirm the selected URL is the attendee join link (`j.php?MTID=...`). A different MTID on a `globalcallin.php` link is expected and that link remains unchanged. Different MTID values among join candidates require manual review. For recurring series, check `MeetingScope` and `HasModifiedOccurrences`. Preview never calls Graph.
+The script updates only rows with both `Status=ReadyForUpdate` and `ApprovedForUpdate=Yes`. Unapproved rows are reported as `AwaitingApproval`. It checks that the Exchange change key matches the stage 1 export and that each selected Webex URL is still present. Changed items are skipped for a fresh fetch/review. Choose a new backup path for each apply run; the backup is written before the EWS update and contains the original body and Location. EWS sends an updated meeting request to attendees.
 
-### Organization-wide sizing report (read-only)
-
-For an inventory across the Exchange SE mailbox types, first create a mailbox-only CSV in Exchange Management Shell. The standalone report script needs only `MailboxSmtp` and `MailboxType`; no Entra lookup or Graph connection is required.
-
-```powershell
-Get-Mailbox -ResultSize Unlimited |
-  Where-Object {
-    $_.RecipientTypeDetails.ToString() -in @('UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox') -and
-    $_.PrimarySmtpAddress
-  } |
-  Select-Object `
-    @{Name='MailboxSmtp'; Expression={$_.PrimarySmtpAddress.ToString()}}, `
-    @{Name='MailboxType'; Expression={$_.RecipientTypeDetails.ToString()}} |
-  Export-Csv -LiteralPath ".\all-mailboxes-preview.csv" -NoTypeInformation -Encoding UTF8
-```
-
-Choose an end date that matches the client's migration planning horizon. There is no finite query for literally every future occurrence. For example, to report the next 12 months:
-
-```powershell
-$inventoryStart = [DateTimeOffset]::UtcNow
-$inventoryEnd = $inventoryStart.AddMonths(12)
-
-.\scripts\Report-WebexMeetingsInventory.ps1 `
-  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
-  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -TargetsCsv ".\all-mailboxes-preview.csv" `
-  -WindowStartUtc $inventoryStart `
-  -WindowEndUtc $inventoryEnd `
-  -ReportPath ".\all-mailboxes-detail.csv" `
-  -SummaryPath ".\all-mailboxes-summary.csv"
-```
-
-The detail report contains one row per calendar item/series outcome. The summary groups item counts by `MailboxType` and `Status`, and includes `MailboxType=All`. For the estimate, sum `WouldApply` and `WouldApplyRecurringSeries`; these are single meetings and recurring series found in the window, with each series counted once. Review skipped statuses and `MailboxError` separately. A successful mailbox with no items gets `NoCalendarItemsInWindow`. The script splits date ranges if EWS says a window has more than 1,000 results; if a one-hour slice still exceeds that limit, it records a mailbox error rather than claiming a complete count.
-
-If a recurring series has an occurrence in the selected window, the script binds to its master and a later Apply updates that series beyond the selected window as well. Modified occurrences are flagged for manual review. Shared and resource mailbox types can be included for inventory, but do not assume they are valid Teams meeting organizers; restrict Apply to organizers confirmed to have Teams and the required application access policy. Ensure the EWS impersonation scope includes the mailbox set being inventoried.
-
-### Step 8 — Prepare Teams links for review (stage 2)
-
-After reviewing the read-only Preview report and confirming the selected Webex links, run `Prepare` over the same target file and UTC window. For the initial one-organizer pilot, use `targets-one.csv`; use the full `targets.csv` only after the pilot is successful. Prepare creates or retrieves a Teams online meeting for each eligible item and writes the join URL to `prepared-preview.csv`. It does not update the EWS calendar items or send invitations.
-
-```powershell
-.\scripts\Convert-WebexMeetingsToTeams.ps1 `
-  -Mode Prepare `
-  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
-  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -TargetsCsv ".\targets-one.csv" `
-  -WindowStartUtc $batchStart `
-  -WindowEndUtc $batchEnd `
-  -GraphTenantId "<TENANT-ID>" `
-  -GraphAppId "<GRAPH-APP-CLIENT-ID>" `
-  -GraphAuthMethod Certificate `
-  -GraphCertificateThumbprint "<CERTIFICATE-THUMBPRINT>" `
-  -ReportPath ".\prepared-preview.csv"
-```
-
-For client-secret authentication, replace the certificate arguments with `-GraphAuthMethod ClientSecret`; the secret cache is populated on the first successful Graph connection. Review every `ReadyForReview` row, including `TeamsJoinUrl`, `OriginalWebexUrl`, `WebexUrlDiagnostics`, start time, and `MeetingScope`. Resolve any `PrepareError` rows before proceeding. The report contains meeting links, so protect it.
-
-This stage calls Graph and creates standalone online-meeting objects. If you stop before Apply, those objects can remain without an Exchange calendar invitation; the script's Exchange rollback does not delete them. Keep the target file and date window unchanged for Apply. Apply performs a fresh EWS scan and calls `createOrGet` again using the deterministic meeting identity, so it retrieves the same link. Apply does not import the prepared CSV as a row-level approval file; review the batch as a whole and narrow the target list/window before Apply if you exclude items. If the calendar changes after Prepare, run Preview and Prepare again before applying.
-
-### Step 9 — Apply to the smallest possible sample (stage 3)
-
-1. Start with one test organizer and one single-instance meeting with only a test attendee.
-2. For the first apply, create a one-row `targets-one.csv` so only that organizer is processed. Run:
-
-   ```powershell
-   .\scripts\Convert-WebexMeetingsToTeams.ps1 `
-     -Mode Apply `
-     -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
-     -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-     -TargetsCsv ".\targets-one.csv" `
-     -WindowStartUtc $batchStart `
-     -WindowEndUtc $batchEnd `
-     -GraphTenantId "<TENANT-ID>" `
-     -GraphAppId "<GRAPH-APP-CLIENT-ID>" `
-     -GraphAuthMethod Certificate `
-     -GraphCertificateThumbprint "<CERTIFICATE-THUMBPRINT>" `
-     -BackupPath ".\teams-poc-backup-pilot.jsonl" `
-     -ReportPath ".\apply.csv"
-   ```
-
-   To use a client secret instead, choose `-GraphAuthMethod ClientSecret` and omit `-GraphCertificateThumbprint`. If this is the first Graph-authenticated run, the script prompts once with hidden input and caches the secret after successful Graph authentication; later runs reuse the DPAPI-encrypted cache. Preview and Rollback do not require Graph authentication.
-
-3. Confirm the script report says `Applied` and capture the Teams URL from the report.
-4. Confirm the organizer's Exchange item has the Teams link in the body and/or Location where the selected Webex URL appeared. Other Webex URLs reported as left untouched will still be present.
-5. Confirm the attendee receives an update (EWS sends to all meeting attendees when the meeting is updated) and can open/join the Teams meeting.
-6. Confirm the Teams app access policy permits the organizer, the lobby/anonymous-join policy behaves as expected, and the Teams meeting object's date/time and subject are appropriate.
-7. Repeat with one simple recurring series without modified occurrences. Confirm the master contains the new URL and multiple occurrences in the series use it. If the report says `HasModifiedOccurrences`, inspect each changed occurrence's invite body and manually replace any remaining Webex URL; the script does not patch exception bodies individually.
-8. Expand to the rest of the pilot only after these end-to-end checks succeed.
-
-EWS meeting updates should be saved with `SendToAllAndSaveCopy`; recipients receive updated meeting requests. [EWS meeting update behavior](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-update-appointments-and-meetings-by-using-ews-in-exchange)
+Confirm the result CSV under `applied` says `Applied` for the expected meetings. Check the organizer's Exchange event and confirm the attendee receives the update and can join Teams. Repeat with a recurring series that has no modified occurrences. If `HasModifiedOccurrences` is true, inspect exception invites manually; the script updates the recurring master only. Check the Teams lobby, anonymous-join, and external-attendee policies before expanding the batch.
 
 ### Step 10 — Roll back if needed
 
-Run the script in `Rollback` mode against the JSONL backup created by `Apply`. It restores the original body and Location on each single item or recurring master and sends a meeting update (for a recurring master, the update is for the series). Before restoring, it verifies both fields still match the post-apply values; changed items are skipped for review. It does not independently back up or restore exception bodies, so manually reviewed/edited exceptions need their own rollback handling. The Teams online meeting object is not deleted; it may remain unused. If rollback is successful, restore the original `CustomAttribute15` values from the CSV you exported, then remove the scope, role assignment, and Teams policy when no longer needed.
+Use the JSONL backup created by stage 3. Rollback restores the saved body and Location if they still match the post-update values, then sends another attendee update. It reports changed items rather than overwriting later edits. It does not restore exception bodies edited manually or delete standalone Graph meetings.
 
 ```powershell
-.\scripts\Convert-WebexMeetingsToTeams.ps1 `
+.\scripts\update_webex_meeting.ps1 `
   -Mode Rollback `
-  -EwsUrl "https://mail.contoso.com/EWS/Exchange.asmx" `
-  -EwsManagedApiDll "C:\Program Files\Microsoft\Exchange\Web Services\2.2\Microsoft.Exchange.WebServices.dll" `
-  -BackupPath ".\teams-poc-backup-YYYYMMDD-HHMMSS.jsonl" `
-  -ReportPath ".\rollback.csv"
+  -EwsUrl $ewsUrl `
+  -EwsManagedApiDll $ewsDll `
+  -BackupPath ".\backups\pilot-update.jsonl" `
+  -OutputDirectory ".\applied" `
+  -Force
 ```
 
-Example cleanup after restoring mailbox attributes:
-
-```powershell
-Remove-ManagementRoleAssignment "WebexTeamsUrlPOCImpersonation" -Confirm:$false
-Remove-ManagementScope "WebexTeamsUrlPOCMailboxes" -Confirm:$false
-Remove-CsApplicationAccessPolicy "WebexTeamsUrlPOC"
-```
-
-Restore the attributes from the exported file by setting each mailbox's prior `CustomAttribute15` value (including clearing it when the prior value was empty). Do not remove a shared/previously existing policy or role assignment; verify ownership first.
+If rollback is successful, restore the original `CustomAttribute15` values from the file exported during setup, then remove only the POC-owned Exchange scope/role assignment and Teams policy. Do not remove shared or pre-existing assignments.
 
 ## 6. Script files and execution notes
 
-- Script: [scripts/Convert-WebexMeetingsToTeams.ps1](scripts/Convert-WebexMeetingsToTeams.ps1)
-- Read-only organization-wide inventory: [scripts/Report-WebexMeetingsInventory.ps1](scripts/Report-WebexMeetingsInventory.ps1)
-- If Preview reports `MailboxError` with `'TimeZone' is a ReadOnly property.`, use the current script version: EWS time zone is supplied to the `ExchangeService(ExchangeVersion, TimeZoneInfo)` constructor. The `TimeZone` property is read-only. [ExchangeService constructors and properties](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.exchangeservice?view=exchange-ews-api)
-- If Preview reports `Cannot find an overload for "Bind"` or `Cannot find an overload for "Load"`, use the current script version. `PropertySet` implements `IEnumerable`; the helper preserves it as one object so PowerShell does not expand its contents into separate arguments. [Appointment.Bind overloads](https://learn.microsoft.com/en-us/dotnet/api/microsoft.exchange.webservices.data.appointment.bind?view=exchange-ews-api), [EWS PropertySet source](https://github.com/OfficeDev/ews-managed-api/blob/master/Core/PropertySet.cs)
-- If an older script rejects `-WindowStartUtc` or `-WindowEndUtc` even though the values end in `Z`, use the current script version, which accepts `DateTimeOffset` parameters. Avoid removing the `Z` and applying `[DateTime]::SpecifyKind` unless the clock values are already UTC; `SpecifyKind` labels a value and does not convert a local time to UTC.
-- Graph API `createOrGet` uses a deterministic external ID derived from organizer, iCalendar UID, and start time. For a recurring series, it uses the recurring master's start time for a stable series ID while setting the Graph meeting time to the occurrence in the scan window. This makes retries idempotent for the same single event or recurring series.
-- The script scans the body and Location field for URLs matching `webex.com` or `webex.eu`. It prefers `j.php?MTID=...` join URLs and groups variants with the same MTID for replacement. It leaves other links, including `globalcallin.php`, unchanged. Different MTID values among join URLs require manual review. Inspect the report's `WebexUrlSource` and `WebexUrlDiagnostics` columns and review custom dial-in content manually.
-- Graph app access policy authorizes the meeting API for the user. It does not grant EWS permissions. The EWS role assignment and the Graph app policy are separate controls.
-- Do not use Graph Calendar API to read/write these on-premises mailbox events. The standard Outlook calendar Graph APIs are for mailbox data stored in Exchange Online. Here, Graph is used only for Teams meeting generation; EWS owns the on-premises calendar item. [Graph Outlook calendar data scope](https://learn.microsoft.com/en-us/graph/outlook-calendar-concept-overview)
-
+- Stage 1 EWS export: [scripts/fetch_webex_meeting.ps1](scripts/fetch_webex_meeting.ps1)
+- Stage 2 Graph link creation: [scripts/create_teams_meeting_link.ps1](scripts/create_teams_meeting_link.ps1)
+- Stage 3 Exchange update and rollback: [scripts/update_webex_meeting.ps1](scripts/update_webex_meeting.ps1)
+- Shared helpers: [scripts/WebexTeams.Common.ps1](scripts/WebexTeams.Common.ps1)
+- Target resolver: [scripts/New-TargetsCsv.ps1](scripts/New-TargetsCsv.ps1)
+- Organization-wide sizing report: [scripts/Report-WebexMeetingsInventory.ps1](scripts/Report-WebexMeetingsInventory.ps1)
+- `scripts/Convert-WebexMeetingsToTeams.ps1` is the earlier combined workflow; use the three stage scripts above for new batches.
+- EWS `TimeZone` is read-only; the scripts set UTC through the `ExchangeService(ExchangeVersion, TimeZoneInfo)` constructor. The shared helper returns `PropertySet` as one object so PowerShell does not expand it into `Bind` or `Load` arguments.
+- Graph `createOrGet` uses a deterministic external ID based on organizer, iCalendar UID, and the recurring master start time, so retrying the same prepared meeting retrieves the existing Teams link.
+- Graph app access policy and EWS impersonation are separate controls. The Graph app policy does not grant EWS permissions.
+- Do not use Graph Calendar API to access on-premises calendar items. EWS reads and updates these Exchange SE items; Graph is used only to create Teams meeting links. [Graph Outlook calendar data scope](https://learn.microsoft.com/en-us/graph/outlook-calendar-concept-overview)

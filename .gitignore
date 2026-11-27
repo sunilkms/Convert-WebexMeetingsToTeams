@@ -1,0 +1,6 @@
+# Per-user calendar reports contain meeting subjects and join URLs.
+/output/
+/prepared/
+/applied/
+/backups/
+*.jsonl
