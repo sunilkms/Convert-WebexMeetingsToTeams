@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Preview', 'Apply', 'Rollback')]
+    [ValidateSet('Preview', 'Prepare', 'Apply', 'Rollback')]
     [string] $Mode = 'Preview',
 
     [Parameter(Mandatory = $true)]
@@ -411,11 +411,11 @@ else {
         }
     }
 
-    if ($Mode -eq 'Apply') {
+    if ($Mode -in @('Prepare', 'Apply')) {
         if (-not $GraphTenantId -or -not $GraphAppId) {
-            throw 'Apply requires GraphTenantId and GraphAppId.'
+            throw "$Mode requires GraphTenantId and GraphAppId."
         }
-        if (Test-Path -LiteralPath $BackupPath) {
+        if ($Mode -eq 'Apply' -and (Test-Path -LiteralPath $BackupPath)) {
             throw "Backup path already exists. Choose a new path so the rollback source is unambiguous: $BackupPath"
         }
         Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
@@ -729,6 +729,16 @@ else {
                         -Subject $appointment.Subject -Start $meetingStart -End $meetingEnd
                     $base.TeamsJoinUrl = $teamsUrl
 
+                    if ($Mode -eq 'Prepare') {
+                        $base.Status = 'ReadyForReview'
+                        $base.Note = 'Teams meeting created or reused; the EWS calendar item was not changed.'
+                        $base.Note += $selectionNote
+                        if ($base.HasModifiedOccurrences) {
+                            $base.Note += ' The series has modified occurrences; this script does not rewrite exception bodies independently. Verify and manually update each exception invite after applying.'
+                        }
+                        $report.Add([pscustomobject]$base); continue
+                    }
+
                     $bodyType = $appointment.Body.BodyType
                     $newBodyText = Get-NewBodyText -OriginalBody $bodyText -OriginalUrls $selectedWebexUrlValues `
                         -TeamsUrl $teamsUrl -BodyType $bodyType
@@ -784,7 +794,7 @@ else {
                     $base.Note += $selectionNote
                 }
                 catch {
-                    $base.Status = 'ApplyError'
+                    $base.Status = if ($Mode -eq 'Prepare') { 'PrepareError' } else { 'ApplyError' }
                     $base.Note = $_.Exception.Message
                 }
                 $report.Add([pscustomobject]$base)
